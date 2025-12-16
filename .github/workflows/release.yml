@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.decision.outputs.publish }}
+      version: ${{ steps.current_version.outputs.result }}
+      reason: ${{ steps.decision.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Fetch tags
+        run: git fetch --tags --force
+      - name: Detect Cargo.toml change
+        id: changes
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            Cargo.toml
+      - name: Read current version
+        id: current_version
+        uses: mikefarah/yq@v4.44.1
+        with:
+          cmd: yq -p toml '.package.version' Cargo.toml | tr -d '\r\n'
+      - name: Read previous version
+        id: previous_version
+        uses: mikefarah/yq@v4.44.1
+        with:
+          cmd: |
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              git show HEAD^:Cargo.toml | yq -p toml '.package.version' | tr -d '\r\n'
+            else
+              echo ""
+            fi
+      - name: Decide release
+        id: decision
+        run: |
+          set -euo pipefail
+          publish=false
+          reason="Cargo.toml unchanged"
+          current="$(echo "${{ steps.current_version.outputs.result }}" | tr -d '\r\n')"
+          previous="$(echo "${{ steps.previous_version.outputs.result }}" | tr -d '\r\n')"
+          if [ "${{ steps.changes.outputs.any_changed }}" = "true" ]; then
+            if [ -z "$previous" ] || [ "$current" != "$previous" ]; then
+              if git rev-parse "v${current}" >/dev/null 2>&1; then
+                reason="Tag v${current} already exists"
+              else
+                publish=true
+                if [ -z "$previous" ]; then
+                  reason="First release detected at version ${current}"
+                else
+                  reason="Version bumped from ${previous} to ${current}"
+                fi
+              fi
+            else
+              reason="Cargo.toml changed but [package] version stayed at ${current}"
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "Release decision: $reason"
+        shell: bash
+
+  create_release:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes "Automated release for version ${VERSION}" \
+            --target "${GITHUB_SHA}"
+
+  build_and_upload:
+    needs: [prepare, create_release]
+    if: needs.prepare.outputs.publish == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+      - name: Setup Cross
+        if: matrix.use_cross == true
+        run: |
+          set -euo pipefail
+          curl -sSfLo /tmp/cross.tar.gz https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf /tmp/cross.tar.gz -C /tmp
+          sudo mv /tmp/cross /usr/local/bin/cross
+      - name: Build release binary
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          VERSION=${{ needs.prepare.outputs.version }}
+          TARGET=${{ matrix.target }}
+          BIN=databend-loki-adapter
+          ARCHIVE="databend-loki-adapter-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/${ARCHIVE}" -C "target/${TARGET}/release" "${BIN}"
+          echo "archive=dist/${ARCHIVE}" >> "$GITHUB_OUTPUT"
+        id: package
+        shell: bash
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          gh release upload "v${VERSION}" "${{ steps.package.outputs.archive }}" --clobber

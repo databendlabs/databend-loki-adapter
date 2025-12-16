@@ -200,9 +200,7 @@ impl FlatSchema {
                 continue;
             }
 
-            if desired_line
-                .as_ref()
-                .map_or(false, |target| lower == *target)
+            if desired_line.as_ref().is_some_and(|target| lower == *target)
                 && explicit_line.is_none()
             {
                 ensure_line_column(&column)?;
@@ -308,10 +306,7 @@ fn numeric_label_clause(
                 LabelOp::RegexNotEq => "NOT IN",
                 _ => unreachable!(),
             };
-            Ok(format!(
-                "{column_ident} {operator} ({})",
-                values.join(", ")
-            ))
+            Ok(format!("{column_ident} {operator} ({})", values.join(", ")))
         }
     }
 }
@@ -332,9 +327,7 @@ fn parse_numeric_literal(raw: &str) -> Option<String> {
     let mut chars = trimmed.chars().peekable();
     if matches!(chars.peek(), Some('+') | Some('-')) {
         chars.next();
-        if chars.peek().is_none() {
-            return None;
-        }
+        chars.peek()?;
     }
     let mut seen_digit = false;
     let mut seen_dot = false;
@@ -423,11 +416,8 @@ mod tests {
 
     #[test]
     fn regex_on_string_column_uses_match() {
-        let clause = label_clause_flat(
-            &matcher("host", LabelOp::RegexEq, "api|edge"),
-            &columns(),
-        )
-        .unwrap();
+        let clause =
+            label_clause_flat(&matcher("host", LabelOp::RegexEq, "api|edge"), &columns()).unwrap();
         assert_eq!(clause, "match(`host`, 'api|edge')");
     }
 
@@ -453,11 +443,8 @@ mod tests {
 
     #[test]
     fn invalid_numeric_regex_returns_error() {
-        let err = label_clause_flat(
-            &matcher("status", LabelOp::RegexEq, "[23]+" ),
-            &columns(),
-        )
-        .unwrap_err();
+        let err = label_clause_flat(&matcher("status", LabelOp::RegexEq, "[23]+"), &columns())
+            .unwrap_err();
         match err {
             AppError::BadRequest(_) => {}
             other => panic!("unexpected error: {other:?}"),

@@ -63,7 +63,7 @@ impl AppState {
         Ok(Self {
             client,
             table,
-            parser: LogqlParser::default(),
+            parser: LogqlParser,
             schema,
         })
     }

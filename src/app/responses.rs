@@ -16,12 +16,8 @@ use std::collections::BTreeMap;
 
 use databend_driver::Row;
 use serde::Serialize;
-use serde_json;
 
-use crate::{
-    databend::SchemaAdapter,
-    error::AppError,
-};
+use crate::{databend::SchemaAdapter, error::AppError};
 
 pub(crate) fn rows_to_streams(
     schema: &SchemaAdapter,

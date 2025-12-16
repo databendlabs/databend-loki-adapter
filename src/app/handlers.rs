@@ -183,7 +183,6 @@ async fn label_values(
 fn current_time_ns() -> i64 {
     let now = Utc::now();
     now.timestamp_nanos_opt()
-        .and_then(|ns| i64::try_from(ns).ok())
         .unwrap_or_else(|| now.timestamp_micros() * 1_000)
 }
 

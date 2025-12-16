@@ -236,13 +236,9 @@ fn is_label_char(ch: char) -> bool {
 mod tests {
     use super::*;
 
-    fn parser() -> LogqlParser {
-        LogqlParser::default()
-    }
-
     #[test]
     fn parse_basic_selector() {
-        let expr = parser().parse("{app=\"loki\",env!=\"prod\"}").unwrap();
+        let expr = LogqlParser.parse("{app=\"loki\",env!=\"prod\"}").unwrap();
         assert_eq!(expr.selectors.len(), 2);
         assert_eq!(expr.filters.len(), 0);
         assert_eq!(expr.selectors[0].key, "app");
@@ -255,7 +251,7 @@ mod tests {
 
     #[test]
     fn parse_with_filters_and_escaped_string() {
-        let expr = parser()
+        let expr = LogqlParser
             .parse("{app=\"loki\"} |= \"error\\\"\" |~ \"warn\\n\" != \"drop\" !~ \"panic\"")
             .unwrap();
         assert_eq!(expr.filters.len(), 4);
@@ -269,13 +265,13 @@ mod tests {
 
     #[test]
     fn parse_fail_on_incomplete_string() {
-        let err = parser().parse("{app=\"loki}").unwrap_err();
+        let err = LogqlParser.parse("{app=\"loki}").unwrap_err();
         assert!(matches!(err, LogqlError::Invalid(_)));
     }
 
     #[test]
     fn parse_fail_on_missing_brace() {
-        let err = parser().parse("{app=\"loki\"").unwrap_err();
+        let err = LogqlParser.parse("{app=\"loki\"").unwrap_err();
         assert!(matches!(err, LogqlError::Invalid(_)));
     }
 }
