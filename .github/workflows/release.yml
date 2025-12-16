@@ -4,10 +4,6 @@ on:
   push:
     branches: [main]
 
-concurrency:
-  group: release
-  cancel-in-progress: true
-
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -72,7 +68,7 @@ jobs:
           echo "Release decision: $reason"
         shell: bash
 
-  create_release:
+  create:
     needs: prepare
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -89,8 +85,8 @@ jobs:
             --notes "Automated release for version ${VERSION}" \
             --target "${GITHUB_SHA}"
 
-  build_and_upload:
-    needs: [prepare, create_release]
+  publish:
+    needs: [prepare, create]
     if: needs.prepare.outputs.publish == 'true'
     strategy:
       matrix:
@@ -123,10 +119,6 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.target }}
       - name: Setup Cross
         if: matrix.use_cross == true
         run: |

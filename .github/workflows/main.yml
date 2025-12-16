@@ -1,14 +1,8 @@
-name: CI
+name: Main
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
 
 jobs:
   lint:
@@ -25,8 +19,6 @@ jobs:
           components: rustfmt, clippy
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
       - name: Cargo fmt
         run: cargo fmt --all --check
       - name: Cargo clippy
@@ -56,9 +48,5 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: build-${{ matrix.target }}
       - name: Cargo build
-        run: cargo build --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
