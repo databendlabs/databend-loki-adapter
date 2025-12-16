@@ -309,6 +309,16 @@ fn is_variant_type(data_type: &str) -> bool {
     lower.contains("variant") || lower.starts_with("map(")
 }
 
+pub(crate) fn is_numeric_type(data_type: &str) -> bool {
+    let lower = data_type.trim().to_ascii_lowercase();
+    lower.contains("int")
+        || lower.contains("decimal")
+        || lower.contains("number")
+        || lower.contains("float")
+        || lower.contains("double")
+        || lower.contains("real")
+}
+
 pub(crate) fn line_filter_clause(line_col: String, filter: &LineFilter) -> String {
     let value = escape(&filter.value);
     match filter.op {
