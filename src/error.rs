@@ -12,6 +12,8 @@ use crate::logql::LogqlError;
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("{0}")]
+    Config(String),
+    #[error("{0}")]
     BadRequest(String),
     #[error(transparent)]
     Databend(#[from] DatabendError),
@@ -25,7 +27,9 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let message = self.to_string();
         let (status, error_type) = match self {
-            Self::BadRequest(_) | Self::Logql(_) => (StatusCode::BAD_REQUEST, "bad_data"),
+            Self::Config(_) | Self::BadRequest(_) | Self::Logql(_) => {
+                (StatusCode::BAD_REQUEST, "bad_data")
+            }
             Self::Databend(_) => (StatusCode::BAD_GATEWAY, "databend_error"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };

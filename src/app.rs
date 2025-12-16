@@ -6,15 +6,15 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use databend_driver::{Client, Row};
+use databend_driver::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
 
 use crate::{
-    databend::{execute_query, log_entry_from_row},
+    databend::{QueryBounds, SchemaConfig, SqlOrder},
+    databend::{SchemaAdapter, SchemaType, TableRef, execute_query, resolve_table_ref},
     error::AppError,
     logql::LogqlParser,
-    sql::{self, QueryBounds, SqlOrder},
 };
 
 const DEFAULT_LIMIT: u64 = 500;
@@ -24,25 +24,41 @@ const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 #[derive(Clone)]
 pub struct AppState {
     client: Client,
-    table: String,
+    table: TableRef,
     parser: LogqlParser,
+    schema: SchemaAdapter,
 }
 
 impl AppState {
-    pub fn new(dsn: String, table: String) -> Self {
-        Self {
-            client: Client::new(dsn),
+    pub async fn bootstrap(config: AppConfig) -> Result<Self, AppError> {
+        let AppConfig {
+            dsn,
+            table,
+            schema_type,
+            schema_config,
+        } = config;
+        let table = resolve_table_ref(&dsn, &table)?;
+        let client = Client::new(dsn.clone());
+        let schema =
+            crate::databend::load_schema(&client, &table, schema_type, &schema_config).await?;
+        Ok(Self {
+            client,
             table,
             parser: LogqlParser::default(),
-        }
+            schema,
+        })
     }
 
     pub fn client(&self) -> &Client {
         &self.client
     }
 
-    pub fn table(&self) -> &str {
+    pub fn table(&self) -> &TableRef {
         &self.table
+    }
+
+    pub fn schema(&self) -> &SchemaAdapter {
+        &self.schema
     }
 
     fn clamp_limit(&self, requested: Option<u64>) -> u64 {
@@ -51,6 +67,13 @@ impl AppState {
             .map(|value| value.min(MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT)
     }
+}
+
+pub struct AppConfig {
+    pub dsn: String,
+    pub table: String,
+    pub schema_type: SchemaType,
+    pub schema_config: SchemaConfig,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -85,7 +108,7 @@ async fn instant_query(
     let start_ns = target_ns.saturating_sub(DEFAULT_LOOKBACK_NS);
     let limit = state.clamp_limit(params.limit);
 
-    let sql = sql::build_select(
+    let sql = state.schema().build_query(
         state.table(),
         &expr,
         &QueryBounds {
@@ -97,7 +120,7 @@ async fn instant_query(
     )?;
 
     let rows = execute_query(state.client(), &sql).await?;
-    let streams = rows_to_streams(rows)?;
+    let streams = rows_to_streams(state.schema(), rows)?;
     Ok(Json(LokiResponse::success(streams)))
 }
 
@@ -121,7 +144,7 @@ async fn range_query(
     }
 
     let limit = state.clamp_limit(params.limit);
-    let sql = sql::build_select(
+    let sql = state.schema().build_query(
         state.table(),
         &expr,
         &QueryBounds {
@@ -133,7 +156,7 @@ async fn range_query(
     )?;
 
     let rows = execute_query(state.client(), &sql).await?;
-    let streams = rows_to_streams(rows)?;
+    let streams = rows_to_streams(state.schema(), rows)?;
     Ok(Json(LokiResponse::success(streams)))
 }
 
@@ -144,10 +167,13 @@ fn current_time_ns() -> i64 {
         .unwrap_or_else(|| now.timestamp_micros() * 1_000)
 }
 
-fn rows_to_streams(rows: Vec<Row>) -> Result<Vec<LokiStream>, AppError> {
+fn rows_to_streams(
+    schema: &SchemaAdapter,
+    rows: Vec<databend_driver::Row>,
+) -> Result<Vec<LokiStream>, AppError> {
     let mut buckets: BTreeMap<String, StreamBucket> = BTreeMap::new();
     for row in rows {
-        let entry = log_entry_from_row(&row)?;
+        let entry = schema.parse_row(&row)?;
         let key = serde_json::to_string(&entry.labels)
             .map_err(|err| AppError::Internal(format!("failed to encode labels: {err}")))?;
         let bucket = buckets
