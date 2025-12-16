@@ -13,6 +13,16 @@ databend-loki-adapter \
 
 The adapter listens on `--bind` (default `0.0.0.0:8080`) and serves `/loki/api/v1/query` and `/loki/api/v1/query_range`.
 
+## Logging
+
+By default the adapter configures `env_logger` with `databend_loki_adapter` at `info` level and every other module at `warn`. This keeps the startup flow visible without flooding the console with dependency logs. To override the levels, set `RUST_LOG` just like any other `env_logger` application, e.g.:
+
+```bash
+RUST_LOG=databend_loki_adapter=debug,databend_driver=info databend-loki-adapter \
+  --dsn "databend://user:pass@host:port/default" \
+  --table logs
+```
+
 ## Configuration
 
 | Flag                 | Env                | Default                 | Description                                                       |

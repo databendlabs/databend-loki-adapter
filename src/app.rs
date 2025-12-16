@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use databend_driver::Client;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json;
 
@@ -37,10 +38,23 @@ impl AppState {
             schema_type,
             schema_config,
         } = config;
+        info!("resolving table reference for `{table}`");
         let table = resolve_table_ref(&dsn, &table)?;
+        info!("table resolved to {}", table.fq_name());
         let client = Client::new(dsn.clone());
+        verify_connection(&client).await?;
+        info!(
+            "loading {} schema metadata for {}",
+            schema_type,
+            table.fq_name()
+        );
         let schema =
             crate::databend::load_schema(&client, &table, schema_type, &schema_config).await?;
+        info!(
+            "{} schema ready; using table {}",
+            schema_type,
+            table.fq_name()
+        );
         Ok(Self {
             client,
             table,
@@ -245,4 +259,20 @@ struct LokiData {
 struct LokiStream {
     stream: BTreeMap<String, String>,
     values: Vec<[String; 2]>,
+}
+
+async fn verify_connection(client: &Client) -> Result<(), AppError> {
+    let conn = client.get_conn().await?;
+    let info = conn.info().await;
+    info!("connected to Databend {}:{}", info.host, info.port);
+    let version = match conn.version().await {
+        Ok(version) => version,
+        Err(err) => {
+            warn!("server version unavailable: {err}");
+            return Ok(());
+        }
+    };
+    info!("server version {version}");
+    let _ = conn.close().await;
+    Ok(())
 }

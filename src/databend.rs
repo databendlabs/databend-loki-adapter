@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Display};
 
 use chrono::{TimeZone, Utc};
 use databend_driver::{Client, Row, Value};
@@ -15,7 +15,7 @@ pub async fn execute_query(client: &Client, sql: &str) -> Result<Vec<Row>, AppEr
     Ok(rows)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TableRef {
     pub database: String,
     pub table: String,
@@ -35,6 +35,15 @@ impl TableRef {
 pub enum SchemaType {
     Loki,
     Flat,
+}
+
+impl Display for SchemaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaType::Loki => write!(f, "loki"),
+            SchemaType::Flat => write!(f, "flat"),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -432,9 +441,9 @@ impl FlatSchema {
 
 async fn fetch_columns(client: &Client, table: &TableRef) -> Result<Vec<TableColumn>, AppError> {
     let query = format!(
-        "SELECT column_name, data_type FROM system.columns WHERE database = '{}' AND table = '{}' ORDER BY ordinal_position",
-        escape_sql(&table.database),
-        escape_sql(&table.table)
+        "SELECT name, data_type FROM system.columns WHERE database = '{db}' AND table = '{tbl}' ORDER BY name",
+        db = escape_sql(&table.database),
+        tbl = escape_sql(&table.table)
     );
     let rows = execute_query(client, &query).await?;
     let mut columns = Vec::new();

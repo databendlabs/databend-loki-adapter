@@ -1,9 +1,10 @@
-use std::net::SocketAddr;
+use std::{fmt::Display, net::SocketAddr};
 
 use app::{AppConfig, AppState, router};
 use clap::{Parser, ValueEnum};
 use databend::{SchemaConfig, SchemaType};
 use error::AppError;
+use log::{LevelFilter, info};
 
 mod app;
 mod databend;
@@ -12,13 +13,17 @@ mod logql;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, disable_help_subcommand = true)]
-struct Cli {
+struct Args {
+    /// Databend DSN string, e.g. databend://user:pass@host:port/db
     #[arg(long = "dsn", env = "DATABEND_DSN")]
     dsn: String,
+    /// Target table to query; can be plain name or db.table
     #[arg(long, env = "LOGS_TABLE", default_value = "logs")]
     table: String,
+    /// HTTP bind address for the adapter server
     #[arg(long = "bind", env = "BIND_ADDR", default_value = "0.0.0.0:8080")]
     bind: SocketAddr,
+    /// Schema interpretation for the table (loki for labels as VARIANT or flat for wide table)
     #[arg(
         long = "schema-type",
         env = "SCHEMA_TYPE",
@@ -26,10 +31,13 @@ struct Cli {
         default_value = "loki"
     )]
     schema_type: SchemaTypeArg,
+    /// Override the column used as the log timestamp
     #[arg(long = "timestamp-column", env = "TIMESTAMP_COLUMN")]
     timestamp_column: Option<String>,
+    /// Override the column used as the log line/payload
     #[arg(long = "line-column", env = "LINE_COLUMN")]
     line_column: Option<String>,
+    /// Override the column storing labels (loki schema only)
     #[arg(long = "labels-column", env = "LABELS_COLUMN")]
     labels_column: Option<String>,
 }
@@ -49,34 +57,57 @@ impl From<SchemaTypeArg> for SchemaType {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
-    if let Err(err) = run(cli).await {
-        eprintln!("server failed: {err}");
+impl Display for SchemaTypeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaTypeArg::Loki => write!(f, "loki"),
+            SchemaTypeArg::Flat => write!(f, "flat"),
+        }
     }
 }
 
-async fn run(cli: Cli) -> Result<(), AppError> {
-    let state = AppState::bootstrap(AppConfig {
-        dsn: cli.dsn.clone(),
-        table: cli.table.clone(),
-        schema_type: cli.schema_type.into(),
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    init_logging();
+    let args = Args::parse();
+    info!(
+        "starting databend-loki-adapter (table={}, schema_type={}, bind={})",
+        args.table, args.schema_type, args.bind
+    );
+    let config = AppConfig {
+        dsn: args.dsn.clone(),
+        table: args.table.clone(),
+        schema_type: args.schema_type.into(),
         schema_config: SchemaConfig {
-            timestamp_column: cli.timestamp_column.clone(),
-            line_column: cli.line_column.clone(),
-            labels_column: cli.labels_column.clone(),
+            timestamp_column: args.timestamp_column.clone(),
+            line_column: args.line_column.clone(),
+            labels_column: args.labels_column.clone(),
         },
-    })
-    .await?;
+    };
+    info!("bootstrapping application state");
+    let state = AppState::bootstrap(config).await?;
+    info!("router initialized, preparing HTTP server");
     let app = router(state);
 
-    let listener = tokio::net::TcpListener::bind(cli.bind)
+    info!("binding TCP listener on {}", args.bind);
+    let listener = tokio::net::TcpListener::bind(args.bind)
         .await
         .map_err(|err| AppError::Internal(format!("failed to bind listener: {err}")))?;
-    println!("databend-loki-adapter listening on {}", cli.bind);
+    info!("databend-loki-adapter listening on {}", args.bind);
+    info!("starting HTTP server");
     axum::serve(listener, app)
         .await
         .map_err(|err| AppError::Internal(format!("server error: {err}")))?;
     Ok(())
+}
+
+fn init_logging() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        env_logger::Builder::from_default_env().init();
+    } else {
+        env_logger::Builder::new()
+            .filter_level(LevelFilter::Warn)
+            .filter_module("databend_loki_adapter", LevelFilter::Info)
+            .init();
+    }
 }
