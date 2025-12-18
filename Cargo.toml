@@ -16,7 +16,7 @@ categories = ["database", "command-line-utilities", "visualization"]
 axum = "0.8.7"
 clap = { version = "4.5.21", features = ["derive", "env"] }
 chrono = { version = "0.4.38", default-features = false, features = ["clock"] }
-databend-driver = "0.32.0"
+databend-driver = "0.33.0"
 env_logger = "0.11.5"
 nom = "8.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
