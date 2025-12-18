@@ -619,6 +619,6 @@ mod tests {
         let pipeline = Pipeline::new(vec![PipelineStage::LabelFormat(stage)]);
         let output = pipeline.process(&labels, "line");
         assert_eq!(output.labels.get("severity"), Some(&"warn".to_string()));
-        assert!(output.labels.get("level").is_none());
+        assert!(!output.labels.contains_key("level"));
     }
 }
