@@ -27,6 +27,7 @@ use super::{flat::FlatSchema, loki::LokiSchema};
 
 pub async fn execute_query(client: &Client, sql: &str) -> Result<Vec<Row>, AppError> {
     let conn = client.get_conn().await?;
+    conn.set_session("timezone", "UTC")?;
     let rows = conn.query_all(sql).await?;
     Ok(rows)
 }

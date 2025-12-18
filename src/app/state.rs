@@ -117,6 +117,7 @@ pub struct AppConfig {
 
 async fn verify_connection(client: &Client) -> Result<(), AppError> {
     let conn = client.get_conn().await?;
+    conn.set_session("timezone", "UTC")?;
     let info = conn.info().await;
     info!("connected to Databend {}:{}", info.host, info.port);
     let version = match conn.version().await {
