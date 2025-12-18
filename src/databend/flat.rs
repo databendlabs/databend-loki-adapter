@@ -116,6 +116,7 @@ impl FlatSchema {
             let value = values[idx + 2].to_string();
             labels.insert(column.name.clone(), value);
         }
+        labels.insert(self.line_col.clone(), line.clone());
         Ok(LogEntry {
             timestamp_ns,
             labels,
