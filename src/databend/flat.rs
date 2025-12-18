@@ -110,6 +110,7 @@ impl FlatSchema {
             ));
         }
         let timestamp_ns = value_to_timestamp(&values[0])?;
+        labels.insert(self.timestamp_col.clone(), values[0].to_string());
         let line = values[1].to_string();
         let mut labels = BTreeMap::new();
         for (idx, column) in self.label_cols.iter().enumerate() {
@@ -126,7 +127,10 @@ impl FlatSchema {
 
     pub(crate) fn list_labels(&self) -> Vec<String> {
         let mut labels: Vec<_> = self.label_cols.iter().map(|col| col.name.clone()).collect();
+        labels.push(self.timestamp_col.clone());
+        labels.push(self.line_col.clone());
         labels.sort();
+        labels.dedup();
         labels
     }
 
@@ -137,9 +141,13 @@ impl FlatSchema {
         label: &str,
         bounds: &LabelQueryBounds,
     ) -> Result<Vec<String>, AppError> {
+        if label == self.timestamp_col || label == self.line_col {
+            return Ok(Vec::new());
+        }
         let column = find_label_column(&self.label_cols, label).ok_or_else(|| {
             AppError::BadRequest(format!("label `{label}` is not available in flat schema"))
         })?;
+        let label_name = column.name.clone();
         let mut clauses = Vec::new();
         let ts_col = quote_ident(&self.timestamp_col);
         if let Some(start) = bounds.start_ns {
@@ -148,7 +156,7 @@ impl FlatSchema {
         if let Some(end) = bounds.end_ns {
             clauses.push(format!("{ts_col} <= {}", timestamp_literal(end)?));
         }
-        let label_col = quote_ident(&column.name);
+        let label_col = quote_ident(&label_name);
         clauses.push(format!("{label_col} IS NOT NULL"));
         let where_clause = if clauses.is_empty() {
             "1=1".to_string()
