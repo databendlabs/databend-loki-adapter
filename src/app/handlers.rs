@@ -91,7 +91,7 @@ async fn instant_query(
     )?;
 
     let rows = execute_query(state.client(), &sql).await?;
-    let streams = rows_to_streams(state.schema(), rows)?;
+    let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
     Ok(Json(LokiResponse::success(streams)))
 }
 
@@ -127,7 +127,7 @@ async fn range_query(
     )?;
 
     let rows = execute_query(state.client(), &sql).await?;
-    let streams = rows_to_streams(state.schema(), rows)?;
+    let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
     Ok(Json(LokiResponse::success(streams)))
 }
 

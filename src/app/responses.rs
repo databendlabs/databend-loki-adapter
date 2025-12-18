@@ -17,21 +17,23 @@ use std::collections::BTreeMap;
 use databend_driver::Row;
 use serde::Serialize;
 
-use crate::{databend::SchemaAdapter, error::AppError};
+use crate::{databend::SchemaAdapter, error::AppError, logql::Pipeline};
 
 pub(crate) fn rows_to_streams(
     schema: &SchemaAdapter,
     rows: Vec<Row>,
+    pipeline: &Pipeline,
 ) -> Result<Vec<LokiStream>, AppError> {
     let mut buckets: BTreeMap<String, StreamBucket> = BTreeMap::new();
     for row in rows {
         let entry = schema.parse_row(&row)?;
-        let key = serde_json::to_string(&entry.labels)
+        let processed = pipeline.process(&entry.labels, &entry.line);
+        let key = serde_json::to_string(&processed.labels)
             .map_err(|err| AppError::Internal(format!("failed to encode labels: {err}")))?;
         let bucket = buckets
             .entry(key)
-            .or_insert_with(|| StreamBucket::new(entry.labels.clone()));
-        bucket.values.push((entry.timestamp_ns, entry.line.clone()));
+            .or_insert_with(|| StreamBucket::new(processed.labels.clone()));
+        bucket.values.push((entry.timestamp_ns, processed.line));
     }
 
     let mut result = Vec::with_capacity(buckets.len());
