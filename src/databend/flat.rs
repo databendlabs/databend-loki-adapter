@@ -110,9 +110,9 @@ impl FlatSchema {
             ));
         }
         let timestamp_ns = value_to_timestamp(&values[0])?;
+        let mut labels = BTreeMap::new();
         labels.insert(self.timestamp_col.clone(), values[0].to_string());
         let line = values[1].to_string();
-        let mut labels = BTreeMap::new();
         for (idx, column) in self.label_cols.iter().enumerate() {
             let value = values[idx + 2].to_string();
             labels.insert(column.name.clone(), value);
