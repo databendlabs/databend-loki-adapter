@@ -167,6 +167,8 @@ impl FlatSchema {
         let buckets_table = format!("({}) AS buckets", buckets_source);
         let ts_col = format!("source.{}", quote_ident(&self.timestamp_col));
         let line_col = format!("source.{}", quote_ident(&self.line_col));
+        let stream_ts_col = format!("stream_source.{}", quote_ident(&self.timestamp_col));
+        let stream_line_col = format!("stream_source.{}", quote_ident(&self.line_col));
         let bucket_window_start = timestamp_offset_expr("bucket_start", -bounds.window_ns);
         let mut join_conditions = vec![
             format!("{ts_col} >= {bucket_window_start}"),
@@ -187,6 +189,28 @@ impl FlatSchema {
                 .map(|f| line_filter_clause(line_col.clone(), f)),
         );
         let join_clause = join_conditions.join(" AND ");
+        let stream_window_start_ns = bounds.start_ns.saturating_sub(bounds.window_ns);
+        let stream_start_literal = timestamp_literal(stream_window_start_ns)?;
+        let stream_end_literal = timestamp_literal(bounds.end_ns)?;
+        let mut stream_conditions = vec![
+            format!("{stream_ts_col} >= {stream_start_literal}"),
+            format!("{stream_ts_col} <= {stream_end_literal}"),
+        ];
+        for matcher in &expr.range.selector.selectors {
+            stream_conditions.push(label_clause_flat(
+                matcher,
+                &self.label_cols,
+                Some("stream_source"),
+            )?);
+        }
+        stream_conditions.extend(
+            expr.range
+                .selector
+                .filters
+                .iter()
+                .map(|f| line_filter_clause(stream_line_col.clone(), f)),
+        );
+        let stream_where_clause = stream_conditions.join(" AND ");
         let value_expr =
             range_bucket_value_expression(expr.range.function, bounds.window_ns, &ts_col);
         match &expr.aggregation {
@@ -196,6 +220,7 @@ impl FlatSchema {
                 &join_clause,
                 &value_expr,
                 &drop_labels,
+                &stream_where_clause,
             ),
             Some(aggregation) => self.metric_range_group_sql(
                 table,
@@ -334,28 +359,75 @@ impl FlatSchema {
         join_clause: &str,
         value_expr: &str,
         drop_labels: &[String],
+        stream_where_clause: &str,
     ) -> Result<MetricRangeQueryPlan, AppError> {
         let retained: Vec<&FlatLabelColumn> = self
             .label_cols
             .iter()
             .filter(|col| !is_dropped_label(&col.name, drop_labels))
             .collect();
+        let stream_projection = if retained.is_empty() {
+            "1 AS stream_exists".to_string()
+        } else {
+            retained
+                .iter()
+                .map(|col| qualified_column(Some("stream_source"), &col.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let stream_cte = format!(
+            "SELECT DISTINCT {projection} FROM {table} AS stream_source WHERE {where}",
+            projection = stream_projection,
+            table = table.fq_name(),
+            where = stream_where_clause,
+        );
         let mut select_parts = vec!["bucket_start AS bucket".to_string()];
         let mut group_parts = vec!["bucket_start".to_string()];
         for col in &retained {
-            let qualified = qualified_column(Some("source"), &col.name);
+            let qualified = qualified_column(Some("stream_labels"), &col.name);
             select_parts.push(qualified.clone());
             group_parts.push(qualified);
         }
         select_parts.push(format!("{value_expr} AS value"));
+        let label_match_clause = if retained.is_empty() {
+            "1=1".to_string()
+        } else {
+            retained
+                .iter()
+                .map(|col| {
+                    format!(
+                        "{source} = {stream}",
+                        source = qualified_column(Some("source"), &col.name),
+                        stream = qualified_column(Some("stream_labels"), &col.name),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        let order_clause = if retained.is_empty() {
+            "bucket".to_string()
+        } else {
+            let mut parts = vec!["bucket".to_string()];
+            parts.extend(
+                retained
+                    .iter()
+                    .map(|col| qualified_column(Some("stream_labels"), &col.name)),
+            );
+            parts.join(", ")
+        };
         let sql = format!(
-            "SELECT {select_clause} FROM {buckets} LEFT JOIN {table} AS source ON {join} \
-             GROUP BY {group_by} ORDER BY bucket",
+            "WITH stream_labels AS ({stream_cte}) \
+             SELECT {select_clause} FROM {buckets} CROSS JOIN stream_labels \
+             LEFT JOIN {table} AS source ON {join} AND {labels_match} \
+             GROUP BY {group_by} ORDER BY {order_clause}",
+            stream_cte = stream_cte,
             select_clause = select_parts.join(", "),
             buckets = buckets_table,
             table = table.fq_name(),
             join = join_clause,
-            group_by = group_parts.join(", ")
+            labels_match = label_match_clause,
+            group_by = group_parts.join(", "),
+            order_clause = order_clause
         );
         Ok(MetricRangeQueryPlan {
             sql,

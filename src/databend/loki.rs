@@ -156,6 +156,9 @@ impl LokiSchema {
         let ts_col = format!("source.{}", quote_ident(&self.timestamp_col));
         let labels_col = format!("source.{}", quote_ident(&self.labels_col));
         let line_col = format!("source.{}", quote_ident(&self.line_col));
+        let stream_ts_col = format!("stream_source.{}", quote_ident(&self.timestamp_col));
+        let stream_labels_col = format!("stream_source.{}", quote_ident(&self.labels_col));
+        let stream_line_col = format!("stream_source.{}", quote_ident(&self.line_col));
         let bucket_window_start = timestamp_offset_expr("bucket_start", -bounds.window_ns);
         let mut join_conditions = vec![
             format!("{ts_col} >= {bucket_window_start}"),
@@ -176,6 +179,28 @@ impl LokiSchema {
                 .map(|f| line_filter_clause(line_col.clone(), f)),
         );
         let join_clause = join_conditions.join(" AND ");
+        let stream_window_start_ns = bounds.start_ns.saturating_sub(bounds.window_ns);
+        let stream_start_literal = timestamp_literal(stream_window_start_ns)?;
+        let stream_end_literal = timestamp_literal(bounds.end_ns)?;
+        let mut stream_conditions = vec![
+            format!("{stream_ts_col} >= {stream_start_literal}"),
+            format!("{stream_ts_col} <= {stream_end_literal}"),
+        ];
+        stream_conditions.extend(
+            expr.range
+                .selector
+                .selectors
+                .iter()
+                .map(|m| label_clause_loki(m, stream_labels_col.clone())),
+        );
+        stream_conditions.extend(
+            expr.range
+                .selector
+                .filters
+                .iter()
+                .map(|f| line_filter_clause(stream_line_col.clone(), f)),
+        );
+        let stream_where_clause = stream_conditions.join(" AND ");
         let value_expr =
             range_bucket_value_expression(expr.range.function, bounds.window_ns, &ts_col);
         match &expr.aggregation {
@@ -183,8 +208,10 @@ impl LokiSchema {
                 table,
                 &buckets_table,
                 &labels_col,
+                &stream_labels_col,
                 &value_expr,
                 &join_clause,
+                &stream_where_clause,
                 &drop_labels,
             ),
             Some(aggregation) => self.metric_range_aggregation_sql(
@@ -293,19 +320,32 @@ impl LokiSchema {
         table: &TableRef,
         buckets_table: &str,
         labels_column: &str,
+        stream_labels_column: &str,
         value_expr: &str,
         join_clause: &str,
+        stream_where_clause: &str,
         drop_labels: &[String],
     ) -> Result<MetricRangeQueryPlan, AppError> {
         let labels_expr = drop_labels_expr(labels_column, drop_labels);
+        let stream_labels_expr = drop_labels_expr(stream_labels_column, drop_labels);
+        let stream_cte = format!(
+            "SELECT DISTINCT {stream_labels_expr} AS labels FROM {table} AS stream_source WHERE {where}",
+            table = table.fq_name(),
+            where = stream_where_clause,
+        );
+        let labels_match_clause = format!("{labels_expr} = stream_labels.labels");
         let sql = format!(
-            "SELECT bucket_start AS bucket, {labels_expr} AS labels, {value_expr} AS value \
-             FROM {buckets} LEFT JOIN {table} AS source ON {join} \
-             GROUP BY bucket_start, {labels_expr} ORDER BY bucket",
+            "WITH stream_labels AS ({stream_cte}) \
+             SELECT bucket_start AS bucket, stream_labels.labels AS labels, {value_expr} AS value \
+             FROM {buckets} CROSS JOIN stream_labels \
+             LEFT JOIN {table} AS source ON {join} AND {labels_match} \
+             GROUP BY bucket_start, stream_labels.labels \
+             ORDER BY bucket, stream_labels.labels",
+            stream_cte = stream_cte,
             buckets = buckets_table,
             table = table.fq_name(),
             join = join_clause,
-            labels_expr = labels_expr
+            labels_match = labels_match_clause
         );
         Ok(MetricRangeQueryPlan {
             sql,
