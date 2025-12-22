@@ -204,25 +204,27 @@ impl LokiSchema {
         let value_expr =
             range_bucket_value_expression(expr.range.function, bounds.window_ns, &ts_col);
         match &expr.aggregation {
-            None => self.metric_range_stream_sql(
+            None => self.metric_range_stream_sql(&MetricRangeStreamContext {
                 table,
-                &buckets_table,
-                &labels_col,
-                &stream_labels_col,
-                &value_expr,
-                &join_clause,
-                &stream_where_clause,
-                &drop_labels,
-            ),
-            Some(aggregation) => self.metric_range_aggregation_sql(
-                table,
-                &buckets_table,
-                &labels_col,
-                &value_expr,
-                &join_clause,
-                aggregation,
-                &drop_labels,
-            ),
+                buckets_table: &buckets_table,
+                labels_column: &labels_col,
+                stream_labels_column: &stream_labels_col,
+                value_expr: &value_expr,
+                join_clause: &join_clause,
+                stream_where_clause: &stream_where_clause,
+                drop_labels: &drop_labels,
+            }),
+            Some(aggregation) => {
+                self.metric_range_aggregation_sql(&MetricRangeAggregationContext {
+                    table,
+                    buckets_table: &buckets_table,
+                    labels_column: &labels_col,
+                    value_expr: &value_expr,
+                    join_clause: &join_clause,
+                    aggregation,
+                    drop_labels: &drop_labels,
+                })
+            }
         }
     }
 
@@ -317,21 +319,14 @@ impl LokiSchema {
 
     fn metric_range_stream_sql(
         &self,
-        table: &TableRef,
-        buckets_table: &str,
-        labels_column: &str,
-        stream_labels_column: &str,
-        value_expr: &str,
-        join_clause: &str,
-        stream_where_clause: &str,
-        drop_labels: &[String],
+        ctx: &MetricRangeStreamContext<'_>,
     ) -> Result<MetricRangeQueryPlan, AppError> {
-        let labels_expr = drop_labels_expr(labels_column, drop_labels);
-        let stream_labels_expr = drop_labels_expr(stream_labels_column, drop_labels);
+        let labels_expr = drop_labels_expr(ctx.labels_column, ctx.drop_labels);
+        let stream_labels_expr = drop_labels_expr(ctx.stream_labels_column, ctx.drop_labels);
         let stream_cte = format!(
             "SELECT DISTINCT {stream_labels_expr} AS labels FROM {table} AS stream_source WHERE {where}",
-            table = table.fq_name(),
-            where = stream_where_clause,
+            table = ctx.table.fq_name(),
+            where = ctx.stream_where_clause,
         );
         let labels_match_clause = format!("{labels_expr} = stream_labels.labels");
         let sql = format!(
@@ -342,9 +337,10 @@ impl LokiSchema {
              GROUP BY bucket_start, stream_labels.labels \
              ORDER BY bucket, stream_labels.labels",
             stream_cte = stream_cte,
-            buckets = buckets_table,
-            table = table.fq_name(),
-            join = join_clause,
+            value_expr = ctx.value_expr,
+            buckets = ctx.buckets_table,
+            table = ctx.table.fq_name(),
+            join = ctx.join_clause,
             labels_match = labels_match_clause
         );
         Ok(MetricRangeQueryPlan {
@@ -355,24 +351,18 @@ impl LokiSchema {
 
     fn metric_range_aggregation_sql(
         &self,
-        table: &TableRef,
-        buckets_table: &str,
-        labels_column: &str,
-        value_expr: &str,
-        join_clause: &str,
-        aggregation: &VectorAggregation,
-        drop_labels: &[String],
+        ctx: &MetricRangeAggregationContext<'_>,
     ) -> Result<MetricRangeQueryPlan, AppError> {
-        if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
+        if let Some(GroupModifier::Without(labels)) = &ctx.aggregation.grouping {
             return Err(AppError::BadRequest(format!(
                 "metric queries do not support `without` grouping ({labels:?})"
             )));
         }
-        let grouping_labels = match &aggregation.grouping {
+        let grouping_labels = match &ctx.aggregation.grouping {
             Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
             _ => Vec::new(),
         };
-        let grouped_labels_expr = drop_labels_expr(labels_column, drop_labels);
+        let grouped_labels_expr = drop_labels_expr(ctx.labels_column, ctx.drop_labels);
         let group_columns = build_loki_group_columns(&grouping_labels, &grouped_labels_expr);
         let mut select_parts = vec!["bucket_start AS bucket".to_string()];
         select_parts.extend(
@@ -380,15 +370,15 @@ impl LokiSchema {
                 .iter()
                 .map(|column| format!("{} AS {}", column.expr, column.alias)),
         );
-        select_parts.push(format!("{value_expr} AS value"));
+        select_parts.push(format!("{} AS value", ctx.value_expr));
         let mut group_parts = vec!["bucket_start".to_string(), grouped_labels_expr.clone()];
         group_parts.extend(group_columns.iter().map(|column| column.expr.clone()));
         let inner_sql = format!(
             "SELECT {select_clause} FROM {buckets} LEFT JOIN {table} AS source ON {join} GROUP BY {group_by}",
             select_clause = select_parts.join(", "),
-            buckets = buckets_table,
-            table = table.fq_name(),
-            join = join_clause,
+            buckets = ctx.buckets_table,
+            table = ctx.table.fq_name(),
+            join = ctx.join_clause,
             group_by = group_parts.join(", ")
         );
         let alias_list: Vec<String> = group_columns
@@ -396,7 +386,7 @@ impl LokiSchema {
             .map(|column| column.alias.clone())
             .collect();
         let alias_clause = alias_list.join(", ");
-        let aggregate = aggregate_value_select(aggregation.op, "value");
+        let aggregate = aggregate_value_select(ctx.aggregation.op, "value");
         let select_prefix = if alias_list.is_empty() {
             format!("bucket, {aggregate}")
         } else {
@@ -589,6 +579,27 @@ impl LokiSchema {
         }
         Ok(values)
     }
+}
+
+struct MetricRangeStreamContext<'a> {
+    table: &'a TableRef,
+    buckets_table: &'a str,
+    labels_column: &'a str,
+    stream_labels_column: &'a str,
+    value_expr: &'a str,
+    join_clause: &'a str,
+    stream_where_clause: &'a str,
+    drop_labels: &'a [String],
+}
+
+struct MetricRangeAggregationContext<'a> {
+    table: &'a TableRef,
+    buckets_table: &'a str,
+    labels_column: &'a str,
+    value_expr: &'a str,
+    join_clause: &'a str,
+    aggregation: &'a VectorAggregation,
+    drop_labels: &'a [String],
 }
 
 fn label_clause_loki(matcher: &LabelMatcher, column: String) -> String {
