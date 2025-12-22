@@ -26,12 +26,16 @@ use serde::Deserialize;
 use std::time::Instant;
 
 use crate::{
-    databend::{LabelQueryBounds, QueryBounds, SqlOrder, execute_query},
+    databend::{
+        LabelQueryBounds, MetricQueryBounds, MetricRangeQueryBounds, QueryBounds, SqlOrder,
+        execute_query,
+    },
     error::AppError,
+    logql::DurationValue,
 };
 
 use super::{
-    responses::{LabelsResponse, LokiResponse, rows_to_streams},
+    responses::{LabelsResponse, LokiResponse, metric_matrix, metric_vector, rows_to_streams},
     state::{AppState, DEFAULT_LOOKBACK_NS},
 };
 
@@ -72,8 +76,30 @@ async fn instant_query(
     Query(params): Query<InstantQueryParams>,
 ) -> Result<Json<LokiResponse>, AppError> {
     let target_ns = params.time.unwrap_or_else(current_time_ns);
+    log::debug!(
+        "instant query received: query=`{}` limit={:?} time_ns={}",
+        params.query,
+        params.limit,
+        target_ns
+    );
     if let Some(response) = try_constant_vector(&params.query, target_ns) {
         return Ok(Json(response));
+    }
+    if let Some(metric) = state.parse_metric(&params.query)? {
+        let duration_ns = metric.range.duration.as_nanoseconds();
+        let start_ns = target_ns.saturating_sub(duration_ns);
+        let plan = state.schema().build_metric_query(
+            state.table(),
+            &metric,
+            &MetricQueryBounds {
+                start_ns,
+                end_ns: target_ns,
+            },
+        )?;
+        log::debug!("instant metric SQL: {}", plan.sql);
+        let rows = execute_query(state.client(), &plan.sql).await?;
+        let samples = state.schema().parse_metric_rows(rows, &plan)?;
+        return Ok(Json(metric_vector(target_ns, samples)));
     }
     let expr = state.parse(&params.query)?;
     let start_ns = target_ns.saturating_sub(DEFAULT_LOOKBACK_NS);
@@ -90,6 +116,13 @@ async fn instant_query(
         },
     )?;
 
+    log::debug!(
+        "instant query SQL (start_ns={}, end_ns={}, limit={}): {}",
+        start_ns,
+        target_ns,
+        limit,
+        sql
+    );
     let rows = execute_query(state.client(), &sql).await?;
     let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
     Ok(Json(LokiResponse::success(streams)))
@@ -99,8 +132,14 @@ async fn range_query(
     State(state): State<AppState>,
     Query(params): Query<RangeQueryParams>,
 ) -> Result<Json<LokiResponse>, AppError> {
-    let expr = state.parse(&params.query)?;
-    let _ = params.step;
+    log::debug!(
+        "range query received: query=`{}` limit={:?} start={:?} end={:?} step={:?}",
+        params.query,
+        params.limit,
+        params.start,
+        params.end,
+        params.step
+    );
     let start = params
         .start
         .ok_or_else(|| AppError::BadRequest("start is required".into()))?;
@@ -114,6 +153,39 @@ async fn range_query(
         ));
     }
 
+    if let Some(metric) = state.parse_metric(&params.query)? {
+        let step_raw = params
+            .step
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("step is required for metric queries".into()))?;
+        let step_duration = DurationValue::parse_literal(step_raw).map_err(|err| {
+            AppError::BadRequest(format!("invalid step duration `{step_raw}`: {err}"))
+        })?;
+        let step_ns = step_duration.as_nanoseconds();
+        let window_ns = metric.range.duration.as_nanoseconds();
+        if step_ns != window_ns {
+            return Err(AppError::BadRequest(
+                "metric range queries require step to match the range selector duration".into(),
+            ));
+        }
+        let plan = state.schema().build_metric_range_query(
+            state.table(),
+            &metric,
+            &MetricRangeQueryBounds {
+                start_ns: start,
+                end_ns: end,
+                step_ns,
+                window_ns,
+            },
+        )?;
+        log::debug!("range metric SQL: {}", plan.sql);
+        let rows = execute_query(state.client(), &plan.sql).await?;
+        let samples = state.schema().parse_metric_matrix_rows(rows, &plan)?;
+        return Ok(Json(metric_matrix(samples)));
+    }
+
+    let expr = state.parse(&params.query)?;
+
     let limit = state.clamp_limit(params.limit);
     let sql = state.schema().build_query(
         state.table(),
@@ -126,6 +198,13 @@ async fn range_query(
         },
     )?;
 
+    log::debug!(
+        "range query SQL (start_ns={}, end_ns={}, limit={}): {}",
+        start,
+        end,
+        limit,
+        sql
+    );
     let rows = execute_query(state.client(), &sql).await?;
     let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
     Ok(Json(LokiResponse::success(streams)))

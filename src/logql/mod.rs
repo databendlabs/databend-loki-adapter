@@ -17,7 +17,8 @@ mod pipeline;
 pub use pipeline::{LineTemplate, Pipeline, PipelineStage};
 
 use pipeline::{
-    JsonPath, JsonSelector, JsonStage, LabelFormatRule, LabelFormatStage, LabelFormatValue,
+    DropStage, JsonPath, JsonSelector, JsonStage, LabelFormatRule, LabelFormatStage,
+    LabelFormatValue,
 };
 
 use nom::{
@@ -27,7 +28,7 @@ use nom::{
     character::complete::{char, multispace0, multispace1, none_of},
     combinator::{all_consuming, cut, map, map_res, opt, recognize},
     error::{Error as NomError, context},
-    multi::{fold_many0, separated_list0, separated_list1},
+    multi::{fold_many0, fold_many1, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded},
 };
 use thiserror::Error;
@@ -37,6 +38,84 @@ pub struct LogqlExpr {
     pub selectors: Vec<LabelMatcher>,
     pub filters: Vec<LineFilter>,
     pub pipeline: Pipeline,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricExpr {
+    pub range: RangeExpr,
+    pub aggregation: Option<VectorAggregation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RangeExpr {
+    pub function: RangeFunction,
+    pub selector: LogqlExpr,
+    pub duration: DurationValue,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RangeFunction {
+    CountOverTime,
+    Rate,
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorAggregation {
+    pub op: VectorAggregationOp,
+    pub grouping: Option<GroupModifier>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum VectorAggregationOp {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count,
+}
+
+#[derive(Debug, Clone)]
+pub enum GroupModifier {
+    By(Vec<String>),
+    Without(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DurationValue {
+    nanoseconds: i64,
+}
+
+impl DurationValue {
+    pub fn new(nanoseconds: i64) -> Result<Self, String> {
+        if nanoseconds <= 0 {
+            return Err("range duration must be positive".into());
+        }
+        Ok(Self { nanoseconds })
+    }
+
+    pub fn as_nanoseconds(&self) -> i64 {
+        self.nanoseconds
+    }
+
+    pub fn parse_literal(input: &str) -> Result<Self, String> {
+        let mut total: i128 = 0;
+        let mut rest = input.trim();
+        if rest.is_empty() {
+            return Err("duration literal cannot be empty".into());
+        }
+        while !rest.is_empty() {
+            let (value, unit_len) = parse_duration_segment(rest)?;
+            total = total
+                .checked_add(value as i128)
+                .ok_or_else(|| "duration value overflowed".to_string())?;
+            rest = &rest[unit_len..];
+            rest = rest.trim_start();
+        }
+        let nanos: i64 = total
+            .try_into()
+            .map_err(|_| "duration exceeds supported range".to_string())?;
+        DurationValue::new(nanos)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +154,10 @@ impl LogqlParser {
     pub fn parse(&self, input: &str) -> Result<LogqlExpr, LogqlError> {
         parse_logql(input)
     }
+
+    pub fn parse_metric(&self, input: &str) -> Result<Option<MetricExpr>, LogqlError> {
+        parse_metric_expr(input)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +175,38 @@ fn parse_logql(input: &str) -> Result<LogqlExpr, LogqlError> {
         .map_err(|err| LogqlError::Invalid(err.to_string()))
 }
 
+fn parse_metric_expr(input: &str) -> Result<Option<MetricExpr>, LogqlError> {
+    if !looks_like_metric(input) {
+        return Ok(None);
+    }
+    all_consuming(delimited(multispace0, metric_expression, multispace0))
+        .parse(input)
+        .map(|(_, expr)| Some(expr))
+        .map_err(|err| LogqlError::Invalid(err.to_string()))
+}
+
+fn looks_like_metric(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    let ident = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic() || *ch == '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if ident.is_empty() {
+        return false;
+    }
+    let metric_tokens = [
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "count",
+        "rate",
+        "count_over_time",
+    ];
+    metric_tokens.iter().any(|token| *token == ident)
+}
+
 fn query(input: &str) -> NomResult<'_, LogqlExpr> {
     let (input, selectors) = selector(input)?;
     let (input, filters) = many_filters(input)?;
@@ -106,6 +221,206 @@ fn query(input: &str) -> NomResult<'_, LogqlExpr> {
     ))
 }
 
+fn metric_expression(input: &str) -> NomResult<'_, MetricExpr> {
+    alt((
+        vector_aggregation_expr,
+        map(range_function_expr, |range| MetricExpr {
+            range,
+            aggregation: None,
+        }),
+    ))
+    .parse(input)
+}
+
+fn vector_aggregation_expr(input: &str) -> NomResult<'_, MetricExpr> {
+    map(
+        pair(
+            aggregation_op,
+            pair(opt(group_modifier), aggregation_argument),
+        ),
+        |(op, (grouping, range))| MetricExpr {
+            range,
+            aggregation: Some(VectorAggregation { op, grouping }),
+        },
+    )
+    .parse(input)
+}
+
+fn aggregation_argument(input: &str) -> NomResult<'_, RangeExpr> {
+    delimited(
+        preceded(multispace0, char('(')),
+        cut(range_function_expr),
+        preceded(multispace0, char(')')),
+    )
+    .parse(input)
+}
+
+fn aggregation_op(input: &str) -> NomResult<'_, VectorAggregationOp> {
+    context(
+        "aggregation operator",
+        preceded(
+            multispace0,
+            alt((
+                map(tag("sum"), |_| VectorAggregationOp::Sum),
+                map(tag("avg"), |_| VectorAggregationOp::Avg),
+                map(tag("min"), |_| VectorAggregationOp::Min),
+                map(tag("max"), |_| VectorAggregationOp::Max),
+                map(tag("count"), |_| VectorAggregationOp::Count),
+            )),
+        ),
+    )
+    .parse(input)
+}
+
+fn group_modifier(input: &str) -> NomResult<'_, GroupModifier> {
+    context(
+        "group modifier",
+        map(
+            pair(
+                preceded(multispace1, alt((tag("by"), tag("without")))),
+                delimited(
+                    preceded(multispace0, char('(')),
+                    cut(label_list),
+                    preceded(multispace0, char(')')),
+                ),
+            ),
+            |(modifier, labels)| match modifier {
+                "by" => GroupModifier::By(labels),
+                "without" => GroupModifier::Without(labels),
+                _ => unreachable!(),
+            },
+        ),
+    )
+    .parse(input)
+}
+
+fn label_list(input: &str) -> NomResult<'_, Vec<String>> {
+    separated_list1(
+        preceded(multispace0, char(',')),
+        preceded(multispace0, label_identifier),
+    )
+    .parse(input)
+}
+
+fn range_function_expr(input: &str) -> NomResult<'_, RangeExpr> {
+    map(
+        pair(
+            range_function,
+            delimited(
+                preceded(multispace0, char('(')),
+                cut(pair(query, preceded(multispace0, range_selector))),
+                preceded(multispace0, char(')')),
+            ),
+        ),
+        |(function, (selector, duration))| RangeExpr {
+            function,
+            selector,
+            duration,
+        },
+    )
+    .parse(input)
+}
+
+fn range_function(input: &str) -> NomResult<'_, RangeFunction> {
+    context(
+        "range function",
+        preceded(
+            multispace0,
+            alt((
+                map(tag("count_over_time"), |_| RangeFunction::CountOverTime),
+                map(tag("rate"), |_| RangeFunction::Rate),
+            )),
+        ),
+    )
+    .parse(input)
+}
+
+fn range_selector(input: &str) -> NomResult<'_, DurationValue> {
+    context(
+        "range selector",
+        delimited(char('['), cut(duration_literal), char(']')),
+    )
+    .parse(input)
+}
+
+fn duration_literal(input: &str) -> NomResult<'_, DurationValue> {
+    context(
+        "duration literal",
+        map_res(
+            recognize(fold_many1(duration_segment_token, || (), |_, _| ())),
+            DurationValue::parse_literal,
+        ),
+    )
+    .parse(input)
+}
+
+fn duration_segment_token(input: &str) -> NomResult<'_, ()> {
+    map(
+        pair(
+            take_while1(|ch: char| ch.is_ascii_digit()),
+            alt((
+                tag("ns"),
+                tag("us"),
+                tag("µs"),
+                tag("ms"),
+                tag("s"),
+                tag("m"),
+                tag("h"),
+                tag("d"),
+                tag("w"),
+            )),
+        ),
+        |_| (),
+    )
+    .parse(input)
+}
+
+fn parse_duration_segment(input: &str) -> Result<(i64, usize), String> {
+    if input.is_empty() {
+        return Err("duration literal cannot be empty".into());
+    }
+    let mut digit_len = 0;
+    for ch in input.chars() {
+        if ch.is_ascii_digit() {
+            digit_len += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if digit_len == 0 {
+        return Err("duration segment is missing digits".into());
+    }
+    let number = input[..digit_len]
+        .parse::<i64>()
+        .map_err(|_| "duration value is not a valid integer".to_string())?;
+    let rest = &input[digit_len..];
+    let (multiplier, unit_len) = duration_unit_multiplier(rest)
+        .ok_or_else(|| "duration segment is missing a valid unit".to_string())?;
+    let total = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration value overflowed".to_string())?;
+    Ok((total, digit_len + unit_len))
+}
+
+fn duration_unit_multiplier(input: &str) -> Option<(i64, usize)> {
+    let units: [(&str, i64); 9] = [
+        ("ns", 1),
+        ("us", 1_000),
+        ("µs", 1_000),
+        ("ms", 1_000_000),
+        ("s", 1_000_000_000),
+        ("m", 60 * 1_000_000_000),
+        ("h", 3_600 * 1_000_000_000),
+        ("d", 86_400 * 1_000_000_000),
+        ("w", 604_800 * 1_000_000_000),
+    ];
+    for (token, multiplier) in units {
+        if input.starts_with(token) {
+            return Some((multiplier, token.len()));
+        }
+    }
+    None
+}
 fn selector(input: &str) -> NomResult<'_, Vec<LabelMatcher>> {
     context(
         "label selector",
@@ -219,6 +534,7 @@ fn pipeline_stage(input: &str) -> NomResult<'_, PipelineStage> {
                         json_stage,
                         line_format_stage,
                         label_format_stage,
+                        drop_stage,
                     )),
                 ),
             ),
@@ -307,6 +623,26 @@ fn label_format_stage(input: &str) -> NomResult<'_, PipelineStage> {
                 ),
             ),
             |rules| PipelineStage::LabelFormat(LabelFormatStage { rules }),
+        ),
+    )
+    .parse(input)
+}
+
+fn drop_stage(input: &str) -> NomResult<'_, PipelineStage> {
+    context(
+        "drop stage",
+        map(
+            preceded(
+                tag("drop"),
+                preceded(
+                    multispace1,
+                    separated_list1(
+                        preceded(multispace0, char(',')),
+                        preceded(multispace0, label_identifier),
+                    ),
+                ),
+            ),
+            |targets| PipelineStage::Drop(DropStage { targets }),
         ),
     )
     .parse(input)
@@ -500,4 +836,104 @@ mod tests {
             _ => panic!("expected label_format stage"),
         }
     }
+
+    #[test]
+    fn parse_drop_stage() {
+        let expr = LogqlParser
+            .parse("{job=\"api\"} | drop __error__,temp_label")
+            .unwrap();
+        assert_eq!(expr.pipeline.stages().len(), 1);
+        match &expr.pipeline.stages()[0] {
+            PipelineStage::Drop(stage) => {
+                assert_eq!(
+                    stage.targets,
+                    vec!["__error__".to_string(), "temp_label".to_string()]
+                );
+            }
+            other => panic!("unexpected stage: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metric_drop_labels_permit_only_drop_stage() {
+        let expr = LogqlParser
+            .parse("{job=\"api\"} | drop __error__,temp_label | drop foo")
+            .unwrap();
+        let drops = expr.pipeline.metric_drop_labels().unwrap();
+        assert_eq!(drops, vec!["__error__".to_string(), "foo".to_string(), "temp_label".to_string()]);
+    }
+
+    #[test]
+    fn metric_drop_labels_rejects_other_stages() {
+        let expr = LogqlParser
+            .parse("{job=\"api\"} | json | drop __error__")
+            .unwrap();
+        let err = expr.pipeline.metric_drop_labels().unwrap_err();
+        assert!(err.contains("drop"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn duration_literal_with_multiple_segments() {
+        let value = DurationValue::parse_literal("1h30m15s").unwrap();
+        assert_eq!(
+            value.as_nanoseconds(),
+            (3_600 + 30 * 60 + 15) * 1_000_000_000
+        );
+        let short = DurationValue::parse_literal("10ms").unwrap();
+        assert_eq!(short.as_nanoseconds(), 10_000_000);
+    }
+
+    #[test]
+    fn duration_literal_rejects_invalid_units() {
+        assert!(DurationValue::parse_literal("").is_err());
+        assert!(DurationValue::parse_literal("10x").is_err());
+        assert!(DurationValue::parse_literal("ms").is_err());
+    }
+
+    #[test]
+    fn parse_metric_rate_without_aggregation() {
+        let parsed = LogqlParser
+            .parse_metric("rate({app=\"api\",env!=\"prod\"}[5m])")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(parsed.range.function, RangeFunction::Rate));
+        assert_eq!(parsed.range.selector.selectors.len(), 2);
+        assert!(parsed.range.selector.pipeline.is_empty());
+        assert_eq!(
+            parsed.range.duration.as_nanoseconds(),
+            5 * 60 * 1_000_000_000
+        );
+        assert!(parsed.aggregation.is_none());
+    }
+
+    #[test]
+    fn parse_metric_sum_by_labels() {
+        let parsed = LogqlParser
+            .parse_metric("sum by (app,instance) (count_over_time({job=\"svc\"}[1h]))")
+            .unwrap()
+            .unwrap();
+        let agg = parsed.aggregation.unwrap();
+        match agg.grouping {
+            Some(GroupModifier::By(labels)) => {
+                assert_eq!(labels, vec!["app".to_string(), "instance".to_string()])
+            }
+            other => panic!("unexpected grouping: {other:?}"),
+        }
+        assert!(matches!(agg.op, VectorAggregationOp::Sum));
+        assert_eq!(
+            parsed.range.duration.as_nanoseconds(),
+            3_600 * 1_000_000_000
+        );
+    }
+
+    #[test]
+    fn parse_metric_non_metric_returns_none() {
+        assert!(
+            LogqlParser
+                .parse_metric("{app=\"loki\"}")
+                .unwrap()
+                .is_none()
+        );
+    }
+
 }

@@ -19,14 +19,19 @@ use log::info;
 
 use crate::{
     error::AppError,
-    logql::{LabelMatcher, LabelOp, LogqlExpr},
+    logql::{
+        GroupModifier, LabelMatcher, LabelOp, LogqlExpr, MetricExpr, RangeFunction,
+        VectorAggregation,
+    },
 };
 
 use super::core::{
-    LabelQueryBounds, LogEntry, QueryBounds, SchemaConfig, TableColumn, TableRef,
-    ensure_line_column, ensure_timestamp_column, escape, execute_query, is_line_candidate,
-    is_numeric_type, line_filter_clause, matches_named_column, missing_required_column,
-    quote_ident, timestamp_literal, value_to_timestamp,
+    LabelQueryBounds, LogEntry, MetricLabelsPlan, MetricQueryBounds, MetricQueryPlan,
+    MetricRangeQueryBounds, MetricRangeQueryPlan, QueryBounds, SchemaConfig, TableColumn, TableRef,
+    aggregate_value_select, ensure_line_column, ensure_timestamp_column, escape, execute_query,
+    format_float_literal, is_line_candidate, is_numeric_type, line_filter_clause,
+    matches_named_column, metric_bucket_cte, missing_required_column, quote_ident,
+    range_bucket_value_expression, timestamp_literal, timestamp_offset_expr, value_to_timestamp,
 };
 
 #[derive(Clone)]
@@ -70,7 +75,7 @@ impl FlatSchema {
         }
 
         for matcher in &expr.selectors {
-            clauses.push(label_clause_flat(matcher, &self.label_cols)?);
+            clauses.push(label_clause_flat(matcher, &self.label_cols, None)?);
         }
         clauses.extend(
             expr.filters
@@ -100,6 +105,337 @@ impl FlatSchema {
             order = bounds.order.sql(),
             limit = bounds.limit
         ))
+    }
+
+    pub(crate) fn build_metric_query(
+        &self,
+        table: &TableRef,
+        expr: &MetricExpr,
+        bounds: &MetricQueryBounds,
+    ) -> Result<MetricQueryPlan, AppError> {
+        let drop_labels = expr
+            .range
+            .selector
+            .pipeline
+            .metric_drop_labels()
+            .map_err(AppError::BadRequest)?;
+        let mut clauses = Vec::new();
+        let ts_col = quote_ident(&self.timestamp_col);
+        clauses.push(format!(
+            "{ts_col} >= {}",
+            timestamp_literal(bounds.start_ns)?
+        ));
+        clauses.push(format!("{ts_col} <= {}", timestamp_literal(bounds.end_ns)?));
+        for matcher in &expr.range.selector.selectors {
+            clauses.push(label_clause_flat(matcher, &self.label_cols, None)?);
+        }
+        clauses.extend(
+            expr.range
+                .selector
+                .filters
+                .iter()
+                .map(|f| line_filter_clause(quote_ident(&self.line_col), f)),
+        );
+        let where_clause = if clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let value_expr =
+            range_value_expression(expr.range.function, expr.range.duration.as_nanoseconds());
+        let mut plan = match &expr.aggregation {
+            None => self.metric_stream_sql(table, &where_clause, &value_expr),
+            Some(aggregation) => {
+                self.metric_group_sql(table, &where_clause, &value_expr, aggregation)
+            }
+        }?;
+        plan.drop_labels = drop_labels;
+        Ok(plan)
+    }
+
+    pub(crate) fn build_metric_range_query(
+        &self,
+        table: &TableRef,
+        expr: &MetricExpr,
+        bounds: &MetricRangeQueryBounds,
+    ) -> Result<MetricRangeQueryPlan, AppError> {
+        let drop_labels = expr
+            .range
+            .selector
+            .pipeline
+            .metric_drop_labels()
+            .map_err(AppError::BadRequest)?;
+        let buckets_source = metric_bucket_cte(bounds)?;
+        let buckets_table = format!("({}) AS buckets", buckets_source);
+        let ts_col = format!("source.{}", quote_ident(&self.timestamp_col));
+        let line_col = format!("source.{}", quote_ident(&self.line_col));
+        let bucket_end = timestamp_offset_expr("bucket_start", bounds.window_ns);
+        let mut join_conditions = vec![
+            format!("{ts_col} >= bucket_start"),
+            format!("{ts_col} < {bucket_end}"),
+        ];
+        for matcher in &expr.range.selector.selectors {
+            join_conditions.push(label_clause_flat(
+                matcher,
+                &self.label_cols,
+                Some("source"),
+            )?);
+        }
+        join_conditions.extend(
+            expr.range
+                .selector
+                .filters
+                .iter()
+                .map(|f| line_filter_clause(line_col.clone(), f)),
+        );
+        let join_clause = join_conditions.join(" AND ");
+        let value_expr =
+            range_bucket_value_expression(expr.range.function, bounds.window_ns, &ts_col);
+        let mut plan = match &expr.aggregation {
+            None => self.metric_range_stream_sql(table, &buckets_table, &join_clause, &value_expr),
+            Some(aggregation) => self.metric_range_group_sql(
+                table,
+                &buckets_table,
+                &join_clause,
+                &value_expr,
+                aggregation,
+            ),
+        }?;
+        plan.drop_labels = drop_labels;
+        Ok(plan)
+    }
+
+    fn metric_stream_sql(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        value_expr: &str,
+    ) -> Result<MetricQueryPlan, AppError> {
+        let mut select_parts: Vec<String> = self
+            .label_cols
+            .iter()
+            .map(|col| quote_ident(&col.name))
+            .collect();
+        select_parts.push(format!("{value_expr} AS value"));
+        let group_by_clause = if self.label_cols.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " GROUP BY {}",
+                self.label_cols
+                    .iter()
+                    .map(|col| quote_ident(&col.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let sql = format!(
+            "SELECT {select_clause} FROM {table} WHERE {where}{group_by}",
+            select_clause = select_parts.join(", "),
+            table = table.fq_name(),
+            where = where_clause,
+            group_by = group_by_clause
+        );
+        Ok(MetricQueryPlan {
+            sql,
+            labels: MetricLabelsPlan::Columns(
+                self.label_cols.iter().map(|col| col.name.clone()).collect(),
+            ),
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn metric_group_sql(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        value_expr: &str,
+        aggregation: &VectorAggregation,
+    ) -> Result<MetricQueryPlan, AppError> {
+        if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
+            return Err(AppError::BadRequest(format!(
+                "metric queries do not support `without` grouping ({labels:?})"
+            )));
+        }
+        let group_labels = match &aggregation.grouping {
+            Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
+            _ => Vec::new(),
+        };
+        let group_columns = self.resolve_group_columns(&group_labels)?;
+        let mut select_parts: Vec<String> = group_columns
+            .iter()
+            .map(|column| format!("{} AS {}", column.expression(None), column.alias))
+            .collect();
+        select_parts.push(format!("{value_expr} AS value"));
+        let group_by_clause = if self.label_cols.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " GROUP BY {}",
+                self.label_cols
+                    .iter()
+                    .map(|col| quote_ident(&col.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let inner_sql = format!(
+            "SELECT {select_clause} FROM {table} WHERE {where}{group_by}",
+            select_clause = select_parts.join(", "),
+            table = table.fq_name(),
+            where = where_clause,
+            group_by = group_by_clause
+        );
+        let alias_list: Vec<String> = group_columns
+            .iter()
+            .map(|column| column.alias.clone())
+            .collect();
+        let alias_clause = alias_list.join(", ");
+        let aggregate = aggregate_value_select(aggregation.op, "value");
+        let outer_select = if alias_list.is_empty() {
+            aggregate.clone()
+        } else {
+            format!("{alias_clause}, {aggregate}")
+        };
+        let outer_group = if alias_list.is_empty() {
+            String::new()
+        } else {
+            format!(" GROUP BY {alias_clause}")
+        };
+        let sql = format!(
+            "WITH stream_data AS ({inner}) SELECT {outer_select} FROM stream_data{outer_group}",
+            inner = inner_sql,
+            outer_select = outer_select,
+            outer_group = outer_group
+        );
+        let labels = if group_labels.is_empty() {
+            MetricLabelsPlan::Columns(Vec::new())
+        } else {
+            MetricLabelsPlan::Columns(group_labels)
+        };
+        Ok(MetricQueryPlan {
+            sql,
+            labels,
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn metric_range_stream_sql(
+        &self,
+        table: &TableRef,
+        buckets_table: &str,
+        join_clause: &str,
+        value_expr: &str,
+    ) -> Result<MetricRangeQueryPlan, AppError> {
+        let mut select_parts = vec!["bucket_start AS bucket".to_string()];
+        let mut group_parts = vec!["bucket_start".to_string()];
+        for col in &self.label_cols {
+            let qualified = qualified_column(Some("source"), &col.name);
+            select_parts.push(qualified.clone());
+            group_parts.push(qualified);
+        }
+        select_parts.push(format!("{value_expr} AS value"));
+        let sql = format!(
+            "SELECT {select_clause} FROM {buckets} LEFT JOIN {table} AS source ON {join} \
+             GROUP BY {group_by} ORDER BY bucket",
+            select_clause = select_parts.join(", "),
+            buckets = buckets_table,
+            table = table.fq_name(),
+            join = join_clause,
+            group_by = group_parts.join(", ")
+        );
+        Ok(MetricRangeQueryPlan {
+            sql,
+            labels: MetricLabelsPlan::Columns(
+                self.label_cols.iter().map(|col| col.name.clone()).collect(),
+            ),
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn metric_range_group_sql(
+        &self,
+        table: &TableRef,
+        buckets_table: &str,
+        join_clause: &str,
+        value_expr: &str,
+        aggregation: &VectorAggregation,
+    ) -> Result<MetricRangeQueryPlan, AppError> {
+        if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
+            return Err(AppError::BadRequest(format!(
+                "metric queries do not support `without` grouping ({labels:?})"
+            )));
+        }
+        let group_labels = match &aggregation.grouping {
+            Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
+            _ => Vec::new(),
+        };
+        let group_columns = self.resolve_group_columns(&group_labels)?;
+        let mut select_parts = vec!["bucket_start AS bucket".to_string()];
+        select_parts.extend(
+            group_columns
+                .iter()
+                .map(|column| format!("{} AS {}", column.expression(Some("source")), column.alias)),
+        );
+        select_parts.push(format!("{value_expr} AS value"));
+        let mut group_parts = vec!["bucket_start".to_string()];
+        group_columns.iter().for_each(|column| {
+            if let Some(expr) = column.group_expression(Some("source")) {
+                group_parts.push(expr);
+            }
+        });
+        let inner_sql = format!(
+            "SELECT {select_clause} FROM {buckets} LEFT JOIN {table} AS source ON {join} GROUP BY {group_by}",
+            select_clause = select_parts.join(", "),
+            buckets = buckets_table,
+            table = table.fq_name(),
+            join = join_clause,
+            group_by = group_parts.join(", ")
+        );
+        let alias_list: Vec<String> = group_columns
+            .iter()
+            .map(|column| column.alias.clone())
+            .collect();
+        let alias_clause = alias_list.join(", ");
+        let aggregate = aggregate_value_select(aggregation.op, "value");
+        let select_prefix = if alias_list.is_empty() {
+            format!("bucket, {aggregate}")
+        } else {
+            format!("bucket, {alias_clause}, {aggregate}")
+        };
+        let group_suffix = if alias_list.is_empty() {
+            " GROUP BY bucket".to_string()
+        } else {
+            format!(" GROUP BY bucket, {alias_clause}")
+        };
+        let sql = format!(
+            "SELECT {select_prefix} FROM ({inner}) AS stream_data{group_suffix} ORDER BY bucket",
+            inner = inner_sql,
+            select_prefix = select_prefix,
+            group_suffix = group_suffix
+        );
+        let labels = if group_labels.is_empty() {
+            MetricLabelsPlan::Columns(Vec::new())
+        } else {
+            MetricLabelsPlan::Columns(group_labels)
+        };
+        Ok(MetricRangeQueryPlan {
+            sql,
+            labels,
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn resolve_group_columns(&self, labels: &[String]) -> Result<Vec<FlatGroupColumn>, AppError> {
+        let mut columns = Vec::with_capacity(labels.len());
+        for (idx, label) in labels.iter().enumerate() {
+            let column = find_label_column(&self.label_cols, label).map(|col| col.name.clone());
+            columns.push(FlatGroupColumn {
+                column,
+                alias: format!("group_{idx}"),
+            });
+        }
+        Ok(columns)
     }
 
     pub(crate) fn parse_row(&self, row: &Row) -> Result<LogEntry, AppError> {
@@ -269,6 +605,7 @@ impl FlatSchema {
 fn label_clause_flat(
     matcher: &LabelMatcher,
     columns: &[FlatLabelColumn],
+    table_alias: Option<&str>,
 ) -> Result<String, AppError> {
     let column = find_label_column(columns, &matcher.key).ok_or_else(|| {
         AppError::BadRequest(format!(
@@ -277,9 +614,9 @@ fn label_clause_flat(
         ))
     })?;
     if column.is_numeric {
-        numeric_label_clause(column, matcher)
+        numeric_label_clause(column, matcher, table_alias)
     } else {
-        let column = quote_ident(&column.name);
+        let column = qualified_column(table_alias, &column.name);
         let value = escape(&matcher.value);
         Ok(match matcher.op {
             LabelOp::Eq => format!("{column} = '{value}'"),
@@ -293,8 +630,9 @@ fn label_clause_flat(
 fn numeric_label_clause(
     column: &FlatLabelColumn,
     matcher: &LabelMatcher,
+    table_alias: Option<&str>,
 ) -> Result<String, AppError> {
-    let column_ident = quote_ident(&column.name);
+    let column_ident = qualified_column(table_alias, &column.name);
     match matcher.op {
         LabelOp::Eq => Ok(format!(
             "{column_ident} = {}",
@@ -398,9 +736,48 @@ fn find_label_column<'a>(
         .find(|col| col.name.eq_ignore_ascii_case(target))
 }
 
+fn qualified_column(alias: Option<&str>, column: &str) -> String {
+    match alias {
+        Some(table) => format!("{table}.{}", quote_ident(column)),
+        None => quote_ident(column),
+    }
+}
+
+struct FlatGroupColumn {
+    column: Option<String>,
+    alias: String,
+}
+
+impl FlatGroupColumn {
+    fn expression(&self, table_alias: Option<&str>) -> String {
+        match &self.column {
+            Some(name) => qualified_column(table_alias, name),
+            None => "CAST(NULL AS VARCHAR)".to_string(),
+        }
+    }
+
+    fn group_expression(&self, table_alias: Option<&str>) -> Option<String> {
+        self.column
+            .as_ref()
+            .map(|name| qualified_column(table_alias, name))
+    }
+}
+
+fn range_value_expression(function: RangeFunction, duration_ns: i64) -> String {
+    match function {
+        RangeFunction::CountOverTime => "COUNT(*)".to_string(),
+        RangeFunction::Rate => {
+            let seconds = duration_ns as f64 / 1_000_000_000_f64;
+            let literal = format_float_literal(seconds);
+            format!("COUNT(*) / {literal}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logql::{DurationValue, Pipeline, RangeExpr, VectorAggregationOp};
 
     fn matcher(key: &str, op: LabelOp, value: &str) -> LabelMatcher {
         LabelMatcher {
@@ -425,8 +802,12 @@ mod tests {
 
     #[test]
     fn regex_on_string_column_uses_match() {
-        let clause =
-            label_clause_flat(&matcher("host", LabelOp::RegexEq, "api|edge"), &columns()).unwrap();
+        let clause = label_clause_flat(
+            &matcher("host", LabelOp::RegexEq, "api|edge"),
+            &columns(),
+            None,
+        )
+        .unwrap();
         assert_eq!(clause, "match(`host`, 'api|edge')");
     }
 
@@ -435,6 +816,7 @@ mod tests {
         let clause = label_clause_flat(
             &matcher("status", LabelOp::RegexEq, "(200|202)"),
             &columns(),
+            None,
         )
         .unwrap();
         assert_eq!(clause, "`status` IN (200, 202)");
@@ -445,6 +827,7 @@ mod tests {
         let clause = label_clause_flat(
             &matcher("status", LabelOp::RegexNotEq, "(200|202)"),
             &columns(),
+            None,
         )
         .unwrap();
         assert_eq!(clause, "`status` NOT IN (200, 202)");
@@ -452,11 +835,57 @@ mod tests {
 
     #[test]
     fn invalid_numeric_regex_returns_error() {
-        let err = label_clause_flat(&matcher("status", LabelOp::RegexEq, "[23]+"), &columns())
-            .unwrap_err();
+        let err = label_clause_flat(
+            &matcher("status", LabelOp::RegexEq, "[23]+"),
+            &columns(),
+            None,
+        )
+        .unwrap_err();
         match err {
             AppError::BadRequest(_) => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn metric_group_allows_missing_label() {
+        let schema = FlatSchema {
+            timestamp_col: "timestamp".to_string(),
+            line_col: "line".to_string(),
+            label_cols: vec![FlatLabelColumn {
+                name: "host".to_string(),
+                is_numeric: false,
+            }],
+        };
+        let expr = MetricExpr {
+            range: RangeExpr {
+                function: RangeFunction::CountOverTime,
+                selector: LogqlExpr {
+                    selectors: Vec::new(),
+                    filters: Vec::new(),
+                    pipeline: Pipeline::default(),
+                },
+                duration: DurationValue::new(1_000_000_000).unwrap(),
+            },
+            aggregation: Some(VectorAggregation {
+                op: VectorAggregationOp::Sum,
+                grouping: Some(GroupModifier::By(vec!["level".to_string()])),
+            }),
+        };
+        let table = TableRef {
+            database: "db".to_string(),
+            table: "tbl".to_string(),
+        };
+        let plan = schema
+            .build_metric_query(
+                &table,
+                &expr,
+                &MetricQueryBounds {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000,
+                },
+            )
+            .unwrap();
+        assert!(plan.sql.contains("CAST(NULL AS VARCHAR) AS group_0"));
     }
 }

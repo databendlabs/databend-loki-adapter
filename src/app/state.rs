@@ -21,7 +21,7 @@ use crate::{
         resolve_table_ref,
     },
     error::AppError,
-    logql::{LogqlExpr, LogqlParser},
+    logql::{LogqlExpr, LogqlParser, MetricExpr},
 };
 
 pub(crate) const DEFAULT_LIMIT: u64 = 500;
@@ -82,6 +82,10 @@ impl AppState {
 
     pub fn parse(&self, query: &str) -> Result<LogqlExpr, AppError> {
         self.parser.parse(query).map_err(AppError::from)
+    }
+
+    pub fn parse_metric(&self, query: &str) -> Result<Option<MetricExpr>, AppError> {
+        self.parser.parse_metric(query).map_err(AppError::from)
     }
 
     pub fn clamp_limit(&self, requested: Option<u64>) -> u64 {

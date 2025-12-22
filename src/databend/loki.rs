@@ -16,14 +16,20 @@ use databend_driver::{Client, Row};
 
 use crate::{
     error::AppError,
-    logql::{LabelMatcher, LabelOp, LogqlExpr},
+    logql::{
+        GroupModifier, LabelMatcher, LabelOp, LogqlExpr, MetricExpr, RangeFunction,
+        VectorAggregation,
+    },
 };
 
 use super::core::{
-    LabelQueryBounds, LogEntry, QueryBounds, SchemaConfig, TableColumn, TableRef,
-    ensure_labels_column, ensure_line_column, ensure_timestamp_column, escape, execute_query,
-    line_filter_clause, matches_line_column, matches_named_column, missing_required_column,
-    parse_labels_value, quote_ident, timestamp_literal, value_to_timestamp,
+    LabelQueryBounds, LogEntry, MetricLabelsPlan, MetricQueryBounds, MetricQueryPlan,
+    MetricRangeQueryBounds, MetricRangeQueryPlan, QueryBounds, SchemaConfig, TableColumn, TableRef,
+    aggregate_value_select, ensure_labels_column, ensure_line_column, ensure_timestamp_column,
+    escape, execute_query, format_float_literal, line_filter_clause, matches_line_column,
+    matches_named_column, metric_bucket_cte, missing_required_column, parse_labels_value,
+    quote_ident, range_bucket_value_expression, timestamp_literal, timestamp_offset_expr,
+    value_to_timestamp,
 };
 
 #[derive(Clone)]
@@ -82,6 +88,295 @@ impl LokiSchema {
             order = bounds.order.sql(),
             limit = bounds.limit
         ))
+    }
+
+    pub(crate) fn build_metric_query(
+        &self,
+        table: &TableRef,
+        expr: &MetricExpr,
+        bounds: &MetricQueryBounds,
+    ) -> Result<MetricQueryPlan, AppError> {
+        let drop_labels = expr
+            .range
+            .selector
+            .pipeline
+            .metric_drop_labels()
+            .map_err(AppError::BadRequest)?;
+        let mut clauses = Vec::new();
+        let ts = quote_ident(&self.timestamp_col);
+        clauses.push(format!("{ts} >= {}", timestamp_literal(bounds.start_ns)?));
+        clauses.push(format!("{ts} <= {}", timestamp_literal(bounds.end_ns)?));
+        clauses.extend(
+            expr.range
+                .selector
+                .selectors
+                .iter()
+                .map(|m| label_clause_loki(m, quote_ident(&self.labels_col))),
+        );
+        clauses.extend(
+            expr.range
+                .selector
+                .filters
+                .iter()
+                .map(|f| line_filter_clause(quote_ident(&self.line_col), f)),
+        );
+        let where_clause = if clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let value_expr =
+            range_value_expression(expr.range.function, expr.range.duration.as_nanoseconds());
+        let mut plan = match &expr.aggregation {
+            None => self.metric_streams_sql(table, &where_clause, &value_expr),
+            Some(aggregation) => {
+                self.metric_aggregation_sql(table, &where_clause, &value_expr, aggregation)
+            }
+        }?;
+        plan.drop_labels = drop_labels;
+        Ok(plan)
+    }
+
+    pub(crate) fn build_metric_range_query(
+        &self,
+        table: &TableRef,
+        expr: &MetricExpr,
+        bounds: &MetricRangeQueryBounds,
+    ) -> Result<MetricRangeQueryPlan, AppError> {
+        let drop_labels = expr
+            .range
+            .selector
+            .pipeline
+            .metric_drop_labels()
+            .map_err(AppError::BadRequest)?;
+        let buckets_source = metric_bucket_cte(bounds)?;
+        let buckets_table = format!("({}) AS buckets", buckets_source);
+        let ts_col = format!("source.{}", quote_ident(&self.timestamp_col));
+        let labels_col = format!("source.{}", quote_ident(&self.labels_col));
+        let line_col = format!("source.{}", quote_ident(&self.line_col));
+        let bucket_end = timestamp_offset_expr("bucket_start", bounds.window_ns);
+        let mut join_conditions = vec![
+            format!("{ts_col} >= bucket_start"),
+            format!("{ts_col} < {bucket_end}"),
+        ];
+        join_conditions.extend(
+            expr.range
+                .selector
+                .selectors
+                .iter()
+                .map(|m| label_clause_loki(m, labels_col.clone())),
+        );
+        join_conditions.extend(
+            expr.range
+                .selector
+                .filters
+                .iter()
+                .map(|f| line_filter_clause(line_col.clone(), f)),
+        );
+        let join_clause = join_conditions.join(" AND ");
+        let value_expr =
+            range_bucket_value_expression(expr.range.function, bounds.window_ns, &ts_col);
+        let mut plan = match &expr.aggregation {
+            None => self.metric_range_stream_sql(
+                table,
+                &buckets_table,
+                &labels_col,
+                &value_expr,
+                &join_clause,
+            ),
+            Some(aggregation) => self.metric_range_aggregation_sql(
+                table,
+                &buckets_table,
+                &labels_col,
+                &value_expr,
+                &join_clause,
+                aggregation,
+            ),
+        }?;
+        plan.drop_labels = drop_labels;
+        Ok(plan)
+    }
+
+    fn metric_streams_sql(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        value_expr: &str,
+    ) -> Result<MetricQueryPlan, AppError> {
+        let labels = quote_ident(&self.labels_col);
+        let sql = format!(
+            "SELECT {labels} AS labels, {value_expr} AS value FROM {table} \
+             WHERE {where} GROUP BY {labels}",
+            table = table.fq_name(),
+            where = where_clause
+        );
+        Ok(MetricQueryPlan {
+            sql,
+            labels: MetricLabelsPlan::LokiFull,
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn metric_aggregation_sql(
+        &self,
+        table: &TableRef,
+        where_clause: &str,
+        value_expr: &str,
+        aggregation: &VectorAggregation,
+    ) -> Result<MetricQueryPlan, AppError> {
+        if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
+            return Err(AppError::BadRequest(format!(
+                "metric queries do not support `without` grouping ({labels:?})"
+            )));
+        }
+        let label_column = quote_ident(&self.labels_col);
+        let grouping_labels = match &aggregation.grouping {
+            Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
+            _ => Vec::new(),
+        };
+        let group_columns = build_loki_group_columns(&grouping_labels, &label_column);
+
+        let mut select_parts: Vec<String> = group_columns
+            .iter()
+            .map(|column| format!("{} AS {}", column.expr, column.alias))
+            .collect();
+        select_parts.push(format!("{value_expr} AS value"));
+        let mut group_parts = vec![label_column.clone()];
+        group_parts.extend(group_columns.iter().map(|column| column.expr.clone()));
+        let inner_sql = format!(
+            "SELECT {select_clause} FROM {table} WHERE {where} GROUP BY {group_by}",
+            select_clause = select_parts.join(", "),
+            table = table.fq_name(),
+            where = where_clause,
+            group_by = group_parts.join(", ")
+        );
+
+        let alias_list: Vec<String> = group_columns
+            .iter()
+            .map(|column| column.alias.clone())
+            .collect();
+        let alias_clause = alias_list.join(", ");
+        let aggregate = aggregate_value_select(aggregation.op, "value");
+        let outer_select = if alias_list.is_empty() {
+            aggregate.clone()
+        } else {
+            format!("{alias_clause}, {aggregate}")
+        };
+        let outer_group = if alias_list.is_empty() {
+            String::new()
+        } else {
+            format!(" GROUP BY {alias_clause}")
+        };
+        let sql = format!(
+            "WITH stream_data AS ({inner}) SELECT {outer_select} FROM stream_data{outer_group}",
+            inner = inner_sql,
+            outer_select = outer_select,
+            outer_group = outer_group
+        );
+
+        let labels = if grouping_labels.is_empty() {
+            MetricLabelsPlan::Columns(Vec::new())
+        } else {
+            MetricLabelsPlan::Columns(grouping_labels)
+        };
+        Ok(MetricQueryPlan {
+            sql,
+            labels,
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn metric_range_stream_sql(
+        &self,
+        table: &TableRef,
+        buckets_table: &str,
+        labels_column: &str,
+        value_expr: &str,
+        join_clause: &str,
+    ) -> Result<MetricRangeQueryPlan, AppError> {
+        let sql = format!(
+            "SELECT bucket_start AS bucket, {labels_column} AS labels, {value_expr} AS value \
+             FROM {buckets} LEFT JOIN {table} AS source ON {join} \
+             GROUP BY bucket_start, {labels_column} ORDER BY bucket",
+            buckets = buckets_table,
+            table = table.fq_name(),
+            join = join_clause
+        );
+        Ok(MetricRangeQueryPlan {
+            sql,
+            labels: MetricLabelsPlan::LokiFull,
+            drop_labels: Vec::new(),
+        })
+    }
+
+    fn metric_range_aggregation_sql(
+        &self,
+        table: &TableRef,
+        buckets_table: &str,
+        labels_column: &str,
+        value_expr: &str,
+        join_clause: &str,
+        aggregation: &VectorAggregation,
+    ) -> Result<MetricRangeQueryPlan, AppError> {
+        if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
+            return Err(AppError::BadRequest(format!(
+                "metric queries do not support `without` grouping ({labels:?})"
+            )));
+        }
+        let grouping_labels = match &aggregation.grouping {
+            Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
+            _ => Vec::new(),
+        };
+        let group_columns = build_loki_group_columns(&grouping_labels, labels_column);
+        let mut select_parts = vec!["bucket_start AS bucket".to_string()];
+        select_parts.extend(
+            group_columns
+                .iter()
+                .map(|column| format!("{} AS {}", column.expr, column.alias)),
+        );
+        select_parts.push(format!("{value_expr} AS value"));
+        let mut group_parts = vec!["bucket_start".to_string()];
+        group_parts.extend(group_columns.iter().map(|column| column.expr.clone()));
+        let inner_sql = format!(
+            "SELECT {select_clause} FROM {buckets} LEFT JOIN {table} AS source ON {join} GROUP BY {group_by}",
+            select_clause = select_parts.join(", "),
+            buckets = buckets_table,
+            table = table.fq_name(),
+            join = join_clause,
+            group_by = group_parts.join(", ")
+        );
+        let alias_list: Vec<String> = group_columns
+            .iter()
+            .map(|column| column.alias.clone())
+            .collect();
+        let alias_clause = alias_list.join(", ");
+        let aggregate = aggregate_value_select(aggregation.op, "value");
+        let select_prefix = if alias_list.is_empty() {
+            format!("bucket, {aggregate}")
+        } else {
+            format!("bucket, {alias_clause}, {aggregate}")
+        };
+        let group_suffix = if alias_list.is_empty() {
+            " GROUP BY bucket".to_string()
+        } else {
+            format!(" GROUP BY bucket, {alias_clause}")
+        };
+        let sql = format!(
+            "SELECT {select_prefix} FROM ({inner}) AS stream_data{group_suffix} ORDER BY bucket",
+            inner = inner_sql,
+            select_prefix = select_prefix,
+            group_suffix = group_suffix
+        );
+        let labels = if grouping_labels.is_empty() {
+            MetricLabelsPlan::Columns(Vec::new())
+        } else {
+            MetricLabelsPlan::Columns(grouping_labels)
+        };
+        Ok(MetricRangeQueryPlan {
+            sql,
+            labels,
+            drop_labels: Vec::new(),
+        })
     }
 
     pub(crate) fn parse_row(&self, row: &Row) -> Result<LogEntry, AppError> {
@@ -262,6 +557,36 @@ fn label_clause_loki(matcher: &LabelMatcher, column: String) -> String {
         LabelOp::RegexEq => format!("match({column}['{key}'], '{value}')", key = matcher.key),
         LabelOp::RegexNotEq => {
             format!("NOT match({column}['{key}'], '{value}')", key = matcher.key)
+        }
+    }
+}
+
+struct LokiGroupColumn {
+    expr: String,
+    alias: String,
+}
+
+fn build_loki_group_columns(labels: &[String], column: &str) -> Vec<LokiGroupColumn> {
+    labels
+        .iter()
+        .enumerate()
+        .map(|(idx, label)| {
+            let escaped = escape(label);
+            LokiGroupColumn {
+                expr: format!("{column}['{escaped}']"),
+                alias: format!("group_{idx}"),
+            }
+        })
+        .collect()
+}
+
+fn range_value_expression(function: RangeFunction, duration_ns: i64) -> String {
+    match function {
+        RangeFunction::CountOverTime => "COUNT(*)".to_string(),
+        RangeFunction::Rate => {
+            let seconds = duration_ns as f64 / 1_000_000_000_f64;
+            let literal = format_float_literal(seconds);
+            format!("COUNT(*) / {literal}")
         }
     }
 }

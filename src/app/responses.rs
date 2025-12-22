@@ -17,7 +17,11 @@ use std::collections::BTreeMap;
 use databend_driver::Row;
 use serde::Serialize;
 
-use crate::{databend::SchemaAdapter, error::AppError, logql::Pipeline};
+use crate::{
+    databend::{MetricMatrixSample, MetricSample, SchemaAdapter},
+    error::AppError,
+    logql::Pipeline,
+};
 
 pub(crate) fn rows_to_streams(
     schema: &SchemaAdapter,
@@ -43,6 +47,34 @@ pub(crate) fn rows_to_streams(
     Ok(result)
 }
 
+pub(crate) fn metric_vector(timestamp_ns: i64, samples: Vec<MetricSample>) -> LokiResponse {
+    let mut vectors = Vec::with_capacity(samples.len());
+    for sample in samples {
+        vectors.push(LokiVectorSample::new(
+            sample.labels,
+            timestamp_ns,
+            sample.value,
+        ));
+    }
+    LokiResponse::vector(vectors)
+}
+
+pub(crate) fn metric_matrix(samples: Vec<MetricMatrixSample>) -> LokiResponse {
+    let mut buckets: BTreeMap<String, MatrixBucket> = BTreeMap::new();
+    for sample in samples {
+        let key = serde_json::to_string(&sample.labels).unwrap_or_else(|_| "{}".to_string());
+        let bucket = buckets
+            .entry(key)
+            .or_insert_with(|| MatrixBucket::new(sample.labels.clone()));
+        bucket.values.push((sample.timestamp_ns, sample.value));
+    }
+    let mut series = Vec::with_capacity(buckets.len());
+    for bucket in buckets.into_values() {
+        series.push(bucket.into_series());
+    }
+    LokiResponse::matrix(series)
+}
+
 struct StreamBucket {
     labels: BTreeMap<String, String>,
     values: Vec<(i128, String)>,
@@ -65,6 +97,33 @@ impl StreamBucket {
             .collect();
         LokiStream {
             stream: self.labels,
+            values,
+        }
+    }
+}
+
+struct MatrixBucket {
+    labels: BTreeMap<String, String>,
+    values: Vec<(i64, f64)>,
+}
+
+impl MatrixBucket {
+    fn new(labels: BTreeMap<String, String>) -> Self {
+        Self {
+            labels,
+            values: Vec::new(),
+        }
+    }
+
+    fn into_series(mut self) -> LokiMatrixSeries {
+        self.values.sort_by_key(|(ts, _)| *ts);
+        let values = self
+            .values
+            .into_iter()
+            .map(|(ts, value)| VectorValue::new(ts, value))
+            .collect();
+        LokiMatrixSeries {
+            metric: self.labels,
             values,
         }
     }
@@ -102,6 +161,15 @@ impl LokiResponse {
             },
         }
     }
+
+    pub(crate) fn matrix(series: Vec<LokiMatrixSeries>) -> Self {
+        Self {
+            status: "success",
+            data: LokiData {
+                result: LokiResult::Matrix { result: series },
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -117,6 +185,8 @@ enum LokiResult {
     Streams { result: Vec<LokiStream> },
     #[serde(rename = "vector")]
     Vector { result: Vec<LokiVectorSample> },
+    #[serde(rename = "matrix")]
+    Matrix { result: Vec<LokiMatrixSeries> },
 }
 
 #[derive(Serialize)]
@@ -138,6 +208,19 @@ impl LokiVectorSample {
             value: VectorValue::new(timestamp_ns, value),
         }
     }
+
+    pub(crate) fn new(metric: BTreeMap<String, String>, timestamp_ns: i64, value: f64) -> Self {
+        Self {
+            metric,
+            value: VectorValue::new(timestamp_ns, value),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct LokiMatrixSeries {
+    metric: BTreeMap<String, String>,
+    values: Vec<VectorValue>,
 }
 
 struct VectorValue {

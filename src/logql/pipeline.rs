@@ -27,6 +27,29 @@ impl Pipeline {
     }
 
     #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+
+    pub fn metric_drop_labels(&self) -> Result<Vec<String>, String> {
+        let mut labels = Vec::new();
+        for stage in &self.stages {
+            match stage {
+                PipelineStage::Drop(stage) => labels.extend(stage.targets.iter().cloned()),
+                _ => {
+                    return Err(
+                        "metric queries only support `drop` stages inside the selector pipeline"
+                            .into(),
+                    );
+                }
+            }
+        }
+        labels.sort();
+        labels.dedup();
+        Ok(labels)
+    }
+
+    #[cfg(test)]
     pub fn stages(&self) -> &[PipelineStage] {
         &self.stages
     }
@@ -58,6 +81,7 @@ pub enum PipelineStage {
     Json(JsonStage),
     LineFormat(LineTemplate),
     LabelFormat(LabelFormatStage),
+    Drop(DropStage),
 }
 
 impl PipelineStage {
@@ -67,6 +91,7 @@ impl PipelineStage {
             PipelineStage::Json(stage) => ctx.extract_json(stage),
             PipelineStage::LineFormat(template) => ctx.apply_template(template),
             PipelineStage::LabelFormat(stage) => ctx.format_labels(stage),
+            PipelineStage::Drop(stage) => ctx.drop_labels(stage),
         }
     }
 }
@@ -217,6 +242,11 @@ pub enum LabelFormatValue {
 }
 
 #[derive(Debug, Clone)]
+pub struct DropStage {
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LineTemplate {
     segments: Vec<TemplateSegment>,
 }
@@ -327,6 +357,13 @@ impl<'a> StageContext<'a> {
                     }
                 }
             }
+        }
+    }
+
+    fn drop_labels(&mut self, stage: &DropStage) {
+        for target in &stage.targets {
+            self.labels.remove(target);
+            self.extracted.remove(target);
         }
     }
 
