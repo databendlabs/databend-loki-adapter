@@ -143,14 +143,12 @@ impl FlatSchema {
         };
         let value_expr =
             range_value_expression(expr.range.function, expr.range.duration.as_nanoseconds());
-        let mut plan = match &expr.aggregation {
-            None => self.metric_stream_sql(table, &where_clause, &value_expr),
+        match &expr.aggregation {
+            None => self.metric_stream_sql(table, &where_clause, &value_expr, &drop_labels),
             Some(aggregation) => {
-                self.metric_group_sql(table, &where_clause, &value_expr, aggregation)
+                self.metric_group_sql(table, &where_clause, &value_expr, aggregation, &drop_labels)
             }
-        }?;
-        plan.drop_labels = drop_labels;
-        Ok(plan)
+        }
     }
 
     pub(crate) fn build_metric_range_query(
@@ -191,18 +189,23 @@ impl FlatSchema {
         let join_clause = join_conditions.join(" AND ");
         let value_expr =
             range_bucket_value_expression(expr.range.function, bounds.window_ns, &ts_col);
-        let mut plan = match &expr.aggregation {
-            None => self.metric_range_stream_sql(table, &buckets_table, &join_clause, &value_expr),
+        match &expr.aggregation {
+            None => self.metric_range_stream_sql(
+                table,
+                &buckets_table,
+                &join_clause,
+                &value_expr,
+                &drop_labels,
+            ),
             Some(aggregation) => self.metric_range_group_sql(
                 table,
                 &buckets_table,
                 &join_clause,
                 &value_expr,
                 aggregation,
+                &drop_labels,
             ),
-        }?;
-        plan.drop_labels = drop_labels;
-        Ok(plan)
+        }
     }
 
     fn metric_stream_sql(
@@ -210,19 +213,22 @@ impl FlatSchema {
         table: &TableRef,
         where_clause: &str,
         value_expr: &str,
+        drop_labels: &[String],
     ) -> Result<MetricQueryPlan, AppError> {
-        let mut select_parts: Vec<String> = self
+        let retained: Vec<&FlatLabelColumn> = self
             .label_cols
             .iter()
-            .map(|col| quote_ident(&col.name))
+            .filter(|col| !is_dropped_label(&col.name, drop_labels))
             .collect();
+        let mut select_parts: Vec<String> =
+            retained.iter().map(|col| quote_ident(&col.name)).collect();
         select_parts.push(format!("{value_expr} AS value"));
-        let group_by_clause = if self.label_cols.is_empty() {
+        let group_by_clause = if retained.is_empty() {
             String::new()
         } else {
             format!(
                 " GROUP BY {}",
-                self.label_cols
+                retained
                     .iter()
                     .map(|col| quote_ident(&col.name))
                     .collect::<Vec<_>>()
@@ -239,9 +245,8 @@ impl FlatSchema {
         Ok(MetricQueryPlan {
             sql,
             labels: MetricLabelsPlan::Columns(
-                self.label_cols.iter().map(|col| col.name.clone()).collect(),
+                retained.iter().map(|col| col.name.clone()).collect(),
             ),
-            drop_labels: Vec::new(),
         })
     }
 
@@ -251,6 +256,7 @@ impl FlatSchema {
         where_clause: &str,
         value_expr: &str,
         aggregation: &VectorAggregation,
+        drop_labels: &[String],
     ) -> Result<MetricQueryPlan, AppError> {
         if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
             return Err(AppError::BadRequest(format!(
@@ -261,18 +267,23 @@ impl FlatSchema {
             Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
             _ => Vec::new(),
         };
-        let group_columns = self.resolve_group_columns(&group_labels)?;
+        let group_columns = self.resolve_group_columns(&group_labels, drop_labels)?;
         let mut select_parts: Vec<String> = group_columns
             .iter()
             .map(|column| format!("{} AS {}", column.expression(None), column.alias))
             .collect();
         select_parts.push(format!("{value_expr} AS value"));
-        let group_by_clause = if self.label_cols.is_empty() {
+        let retained: Vec<&FlatLabelColumn> = self
+            .label_cols
+            .iter()
+            .filter(|col| !is_dropped_label(&col.name, drop_labels))
+            .collect();
+        let group_by_clause = if retained.is_empty() {
             String::new()
         } else {
             format!(
                 " GROUP BY {}",
-                self.label_cols
+                retained
                     .iter()
                     .map(|col| quote_ident(&col.name))
                     .collect::<Vec<_>>()
@@ -313,11 +324,7 @@ impl FlatSchema {
         } else {
             MetricLabelsPlan::Columns(group_labels)
         };
-        Ok(MetricQueryPlan {
-            sql,
-            labels,
-            drop_labels: Vec::new(),
-        })
+        Ok(MetricQueryPlan { sql, labels })
     }
 
     fn metric_range_stream_sql(
@@ -326,10 +333,16 @@ impl FlatSchema {
         buckets_table: &str,
         join_clause: &str,
         value_expr: &str,
+        drop_labels: &[String],
     ) -> Result<MetricRangeQueryPlan, AppError> {
+        let retained: Vec<&FlatLabelColumn> = self
+            .label_cols
+            .iter()
+            .filter(|col| !is_dropped_label(&col.name, drop_labels))
+            .collect();
         let mut select_parts = vec!["bucket_start AS bucket".to_string()];
         let mut group_parts = vec!["bucket_start".to_string()];
-        for col in &self.label_cols {
+        for col in &retained {
             let qualified = qualified_column(Some("source"), &col.name);
             select_parts.push(qualified.clone());
             group_parts.push(qualified);
@@ -347,9 +360,8 @@ impl FlatSchema {
         Ok(MetricRangeQueryPlan {
             sql,
             labels: MetricLabelsPlan::Columns(
-                self.label_cols.iter().map(|col| col.name.clone()).collect(),
+                retained.iter().map(|col| col.name.clone()).collect(),
             ),
-            drop_labels: Vec::new(),
         })
     }
 
@@ -360,6 +372,7 @@ impl FlatSchema {
         join_clause: &str,
         value_expr: &str,
         aggregation: &VectorAggregation,
+        drop_labels: &[String],
     ) -> Result<MetricRangeQueryPlan, AppError> {
         if let Some(GroupModifier::Without(labels)) = &aggregation.grouping {
             return Err(AppError::BadRequest(format!(
@@ -370,7 +383,7 @@ impl FlatSchema {
             Some(GroupModifier::By(labels)) if !labels.is_empty() => labels.clone(),
             _ => Vec::new(),
         };
-        let group_columns = self.resolve_group_columns(&group_labels)?;
+        let group_columns = self.resolve_group_columns(&group_labels, drop_labels)?;
         let mut select_parts = vec!["bucket_start AS bucket".to_string()];
         select_parts.extend(
             group_columns
@@ -419,17 +432,21 @@ impl FlatSchema {
         } else {
             MetricLabelsPlan::Columns(group_labels)
         };
-        Ok(MetricRangeQueryPlan {
-            sql,
-            labels,
-            drop_labels: Vec::new(),
-        })
+        Ok(MetricRangeQueryPlan { sql, labels })
     }
 
-    fn resolve_group_columns(&self, labels: &[String]) -> Result<Vec<FlatGroupColumn>, AppError> {
+    fn resolve_group_columns(
+        &self,
+        labels: &[String],
+        drop_labels: &[String],
+    ) -> Result<Vec<FlatGroupColumn>, AppError> {
         let mut columns = Vec::with_capacity(labels.len());
         for (idx, label) in labels.iter().enumerate() {
-            let column = find_label_column(&self.label_cols, label).map(|col| col.name.clone());
+            let column = if is_dropped_label(label, drop_labels) {
+                None
+            } else {
+                find_label_column(&self.label_cols, label).map(|col| col.name.clone())
+            };
             columns.push(FlatGroupColumn {
                 column,
                 alias: format!("group_{idx}"),
@@ -734,6 +751,12 @@ fn find_label_column<'a>(
     columns
         .iter()
         .find(|col| col.name.eq_ignore_ascii_case(target))
+}
+
+fn is_dropped_label(target: &str, drop_labels: &[String]) -> bool {
+    drop_labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(target))
 }
 
 fn qualified_column(alias: Option<&str>, column: &str) -> String {

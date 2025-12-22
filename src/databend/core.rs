@@ -230,14 +230,12 @@ pub struct MetricMatrixSample {
 pub struct MetricQueryPlan {
     pub sql: String,
     pub labels: MetricLabelsPlan,
-    pub drop_labels: Vec<String>,
 }
 
 #[derive(Clone)]
 pub struct MetricRangeQueryPlan {
     pub sql: String,
     pub labels: MetricLabelsPlan,
-    pub drop_labels: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -604,10 +602,7 @@ fn parse_metric_rows(
         };
         samples.push(MetricSample { labels, value });
     }
-    if plan.drop_labels.is_empty() {
-        return Ok(samples);
-    }
-    Ok(collapse_metric_samples(samples, &plan.drop_labels))
+    Ok(samples)
 }
 
 fn parse_metric_matrix_rows(
@@ -659,10 +654,7 @@ fn parse_metric_matrix_rows(
             value,
         });
     }
-    if plan.drop_labels.is_empty() {
-        return Ok(samples);
-    }
-    Ok(collapse_metric_matrix_samples(samples, &plan.drop_labels))
+    Ok(samples)
 }
 
 fn metric_label_string(value: &Value) -> Option<String> {
@@ -720,113 +712,4 @@ fn metric_number_to_f64(num: &NumberValue) -> Result<f64, AppError> {
             .map_err(|_| AppError::Internal("metric decimal value overflowed".into()))?,
     };
     Ok(value)
-}
-
-fn collapse_metric_samples(
-    samples: Vec<MetricSample>,
-    drop_labels: &[String],
-) -> Vec<MetricSample> {
-    let mut buckets: BTreeMap<String, MetricSample> = BTreeMap::new();
-    for sample in samples {
-        let mut labels = sample.labels;
-        drop_labels_from_map(&mut labels, drop_labels);
-        let key = labels_identity(&labels);
-        buckets
-            .entry(key)
-            .and_modify(|entry| entry.value += sample.value)
-            .or_insert(MetricSample {
-                labels,
-                value: sample.value,
-            });
-    }
-    buckets.into_values().collect()
-}
-
-fn collapse_metric_matrix_samples(
-    samples: Vec<MetricMatrixSample>,
-    drop_labels: &[String],
-) -> Vec<MetricMatrixSample> {
-    let mut buckets: BTreeMap<(String, i64), MetricMatrixSample> = BTreeMap::new();
-    for sample in samples {
-        let mut labels = sample.labels;
-        drop_labels_from_map(&mut labels, drop_labels);
-        let key = labels_identity(&labels);
-        buckets
-            .entry((key, sample.timestamp_ns))
-            .and_modify(|entry| entry.value += sample.value)
-            .or_insert(MetricMatrixSample {
-                labels,
-                timestamp_ns: sample.timestamp_ns,
-                value: sample.value,
-            });
-    }
-    buckets.into_values().collect()
-}
-
-fn drop_labels_from_map(labels: &mut BTreeMap<String, String>, drop_labels: &[String]) {
-    for target in drop_labels {
-        labels.remove(target);
-    }
-}
-
-fn labels_identity(labels: &BTreeMap<String, String>) -> String {
-    serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample(labels: &[(&str, &str)], value: f64) -> MetricSample {
-        let mut map = BTreeMap::new();
-        for (key, val) in labels {
-            map.insert((*key).to_string(), (*val).to_string());
-        }
-        MetricSample { labels: map, value }
-    }
-
-    #[test]
-    fn collapse_metric_samples_merges_by_dropped_labels() {
-        let samples = vec![
-            sample(&[("app", "api"), ("__error__", "foo")], 2.0),
-            sample(&[("app", "api"), ("__error__", "bar")], 3.0),
-        ];
-        let drops = vec!["__error__".to_string()];
-        let collapsed = collapse_metric_samples(samples, &drops);
-        assert_eq!(collapsed.len(), 1);
-        assert_eq!(collapsed[0].value, 5.0);
-        assert!(collapsed[0].labels.get("__error__").is_none());
-    }
-
-    #[test]
-    fn collapse_metric_matrix_samples_merge_per_timestamp() {
-        let samples = vec![
-            MetricMatrixSample {
-                labels: {
-                    let mut map = BTreeMap::new();
-                    map.insert("app".to_string(), "api".to_string());
-                    map.insert("__error__".to_string(), "foo".to_string());
-                    map
-                },
-                timestamp_ns: 100,
-                value: 1.0,
-            },
-            MetricMatrixSample {
-                labels: {
-                    let mut map = BTreeMap::new();
-                    map.insert("app".to_string(), "api".to_string());
-                    map.insert("__error__".to_string(), "bar".to_string());
-                    map
-                },
-                timestamp_ns: 100,
-                value: 2.0,
-            },
-        ];
-        let drops = vec!["__error__".to_string()];
-        let collapsed = collapse_metric_matrix_samples(samples, &drops);
-        assert_eq!(collapsed.len(), 1);
-        assert_eq!(collapsed[0].timestamp_ns, 100);
-        assert_eq!(collapsed[0].value, 3.0);
-        assert!(collapsed[0].labels.get("__error__").is_none());
-    }
 }
