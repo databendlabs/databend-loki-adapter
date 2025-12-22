@@ -860,7 +860,14 @@ mod tests {
             .parse("{job=\"api\"} | drop __error__,temp_label | drop foo")
             .unwrap();
         let drops = expr.pipeline.metric_drop_labels().unwrap();
-        assert_eq!(drops, vec!["__error__".to_string(), "foo".to_string(), "temp_label".to_string()]);
+        assert_eq!(
+            drops,
+            vec![
+                "__error__".to_string(),
+                "foo".to_string(),
+                "temp_label".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -935,5 +942,4 @@ mod tests {
                 .is_none()
         );
     }
-
 }
