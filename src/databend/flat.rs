@@ -169,10 +169,10 @@ impl FlatSchema {
         let buckets_table = format!("({}) AS buckets", buckets_source);
         let ts_col = format!("source.{}", quote_ident(&self.timestamp_col));
         let line_col = format!("source.{}", quote_ident(&self.line_col));
-        let bucket_end = timestamp_offset_expr("bucket_start", bounds.window_ns);
+        let bucket_window_start = timestamp_offset_expr("bucket_start", -bounds.window_ns);
         let mut join_conditions = vec![
-            format!("{ts_col} >= bucket_start"),
-            format!("{ts_col} < {bucket_end}"),
+            format!("{ts_col} >= {bucket_window_start}"),
+            format!("{ts_col} <= bucket_start"),
         ];
         for matcher in &expr.range.selector.selectors {
             join_conditions.push(label_clause_flat(

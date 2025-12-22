@@ -154,10 +154,10 @@ impl LokiSchema {
         let ts_col = format!("source.{}", quote_ident(&self.timestamp_col));
         let labels_col = format!("source.{}", quote_ident(&self.labels_col));
         let line_col = format!("source.{}", quote_ident(&self.line_col));
-        let bucket_end = timestamp_offset_expr("bucket_start", bounds.window_ns);
+        let bucket_window_start = timestamp_offset_expr("bucket_start", -bounds.window_ns);
         let mut join_conditions = vec![
-            format!("{ts_col} >= bucket_start"),
-            format!("{ts_col} < {bucket_end}"),
+            format!("{ts_col} >= {bucket_window_start}"),
+            format!("{ts_col} <= bucket_start"),
         ];
         join_conditions.extend(
             expr.range
