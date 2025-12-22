@@ -158,9 +158,7 @@ async fn range_query(
             .step
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("step is required for metric queries".into()))?;
-        let step_duration = DurationValue::parse_literal(step_raw).map_err(|err| {
-            AppError::BadRequest(format!("invalid step duration `{step_raw}`: {err}"))
-        })?;
+        let step_duration = parse_step_duration(step_raw)?;
         let step_ns = step_duration.as_nanoseconds();
         let window_ns = metric.range.duration.as_nanoseconds();
         if step_ns != window_ns {
@@ -208,6 +206,44 @@ async fn range_query(
     let rows = execute_query(state.client(), &sql).await?;
     let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
     Ok(Json(LokiResponse::success(streams)))
+}
+
+fn parse_step_duration(step_raw: &str) -> Result<DurationValue, AppError> {
+    match DurationValue::parse_literal(step_raw) {
+        Ok(value) => Ok(value),
+        Err(literal_err) => match parse_numeric_step_seconds(step_raw) {
+            Ok(value) => Ok(value),
+            Err(numeric_err) => Err(AppError::BadRequest(format!(
+                "invalid step duration `{step_raw}`: {literal_err}; {numeric_err}"
+            ))),
+        },
+    }
+}
+
+fn parse_numeric_step_seconds(step_raw: &str) -> Result<DurationValue, String> {
+    let trimmed = step_raw.trim();
+    if trimmed.is_empty() {
+        return Err("numeric seconds cannot be empty".into());
+    }
+    let seconds: f64 = trimmed
+        .parse()
+        .map_err(|err| format!("failed to parse numeric seconds: {err}"))?;
+    if !seconds.is_finite() {
+        return Err("numeric seconds must be finite".into());
+    }
+    if seconds <= 0.0 {
+        return Err("numeric seconds must be positive".into());
+    }
+    let nanos = seconds * 1_000_000_000.0;
+    if nanos <= 0.0 {
+        return Err("numeric seconds are too small".into());
+    }
+    if nanos > i64::MAX as f64 {
+        return Err("numeric seconds exceed supported range".into());
+    }
+    let nanos = nanos.round() as i64;
+    DurationValue::new(nanos)
+        .map_err(|err| format!("failed to convert numeric seconds to duration: {err}"))
 }
 
 async fn label_names(
