@@ -439,45 +439,6 @@ fn escape_like_pattern(value: &str) -> String {
     escaped
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::logql::{LineFilter, LineFilterOp};
-
-    #[test]
-    fn contains_uses_like_with_escaping() {
-        let filter = LineFilter {
-            op: LineFilterOp::Contains,
-            value: "foo%_\\'bar".into(),
-        };
-        let clause = line_filter_clause("line_col".into(), &filter);
-        assert_eq!(
-            clause,
-            "line_col LIKE '%foo\\%\\_\\\\''bar%' ESCAPE '\\\\'"
-        );
-    }
-
-    #[test]
-    fn not_contains_negates_like() {
-        let filter = LineFilter {
-            op: LineFilterOp::NotContains,
-            value: "needle".into(),
-        };
-        let clause = line_filter_clause("line_col".into(), &filter);
-        assert_eq!(clause, "line_col NOT LIKE '%needle%' ESCAPE '\\\\'");
-    }
-
-    #[test]
-    fn regex_filters_keep_match_calls() {
-        let filter = LineFilter {
-            op: LineFilterOp::Regex,
-            value: "foo.*".into(),
-        };
-        let clause = line_filter_clause("line_col".into(), &filter);
-        assert_eq!(clause, "match(line_col, 'foo.*')");
-    }
-}
-
 pub(crate) fn timestamp_literal(ns: i64) -> Result<String, AppError> {
     let secs = ns.div_euclid(1_000_000_000);
     let nanos = ns.rem_euclid(1_000_000_000) as u32;
@@ -777,4 +738,40 @@ fn metric_number_to_f64(num: &NumberValue) -> Result<f64, AppError> {
             .map_err(|_| AppError::Internal("metric decimal value overflowed".into()))?,
     };
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logql::{LineFilter, LineFilterOp};
+
+    #[test]
+    fn contains_uses_like_with_escaping() {
+        let filter = LineFilter {
+            op: LineFilterOp::Contains,
+            value: "foo%_\\'bar".into(),
+        };
+        let clause = line_filter_clause("line_col".into(), &filter);
+        assert_eq!(clause, "line_col LIKE '%foo\\%\\_\\\\''bar%' ESCAPE '\\\\'");
+    }
+
+    #[test]
+    fn not_contains_negates_like() {
+        let filter = LineFilter {
+            op: LineFilterOp::NotContains,
+            value: "needle".into(),
+        };
+        let clause = line_filter_clause("line_col".into(), &filter);
+        assert_eq!(clause, "line_col NOT LIKE '%needle%' ESCAPE '\\\\'");
+    }
+
+    #[test]
+    fn regex_filters_keep_match_calls() {
+        let filter = LineFilter {
+            op: LineFilterOp::Regex,
+            value: "foo.*".into(),
+        };
+        let clause = line_filter_clause("line_col".into(), &filter);
+        assert_eq!(clause, "match(line_col, 'foo.*')");
+    }
 }
