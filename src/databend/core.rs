@@ -164,6 +164,18 @@ impl SchemaAdapter {
             }
         }
     }
+
+    pub fn build_index_stats_query(
+        &self,
+        table: &TableRef,
+        expr: &LogqlExpr,
+        bounds: &StatsQueryBounds,
+    ) -> Result<StatsQueryPlan, AppError> {
+        match self {
+            SchemaAdapter::Loki(schema) => schema.build_index_stats_query(table, expr, bounds),
+            SchemaAdapter::Flat(schema) => schema.build_index_stats_query(table, expr, bounds),
+        }
+    }
 }
 
 pub struct QueryBounds {
@@ -183,6 +195,11 @@ pub struct MetricRangeQueryBounds {
     pub end_ns: i64,
     pub step_ns: i64,
     pub window_ns: i64,
+}
+
+pub struct StatsQueryBounds {
+    pub start_ns: i64,
+    pub end_ns: i64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -236,6 +253,10 @@ pub struct MetricQueryPlan {
 pub struct MetricRangeQueryPlan {
     pub sql: String,
     pub labels: MetricLabelsPlan,
+}
+
+pub struct StatsQueryPlan {
+    pub sql: String,
 }
 
 #[derive(Clone)]

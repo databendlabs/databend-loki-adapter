@@ -25,14 +25,15 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use databend_driver::{NumberValue, Row, Value};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, time::Instant};
 use tokio::time::{Duration, sleep};
 
 use crate::{
     databend::{
         LabelQueryBounds, MetricQueryBounds, MetricRangeQueryBounds, QueryBounds, SqlOrder,
-        execute_query,
+        StatsQueryBounds, execute_query,
     },
     error::AppError,
     logql::{DurationValue, LogqlExpr},
@@ -57,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/label/{label}/values", get(label_values))
         .route("/loki/api/v1/query", get(instant_query))
         .route("/loki/api/v1/query_range", get(range_query))
+        .route("/loki/api/v1/index/stats", get(index_stats))
         .route("/loki/api/v1/tail", get(tail_logs))
         .with_state(state)
         .layer(middleware::from_fn(log_requests))
@@ -90,6 +92,21 @@ struct TailQueryParams {
     limit: Option<u64>,
     start: Option<i64>,
     delay_for: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsQueryParams {
+    query: Option<String>,
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct IndexStatsResponse {
+    streams: u64,
+    chunks: u64,
+    entries: u64,
+    bytes: u64,
 }
 
 async fn instant_query(
@@ -229,6 +246,50 @@ async fn range_query(
     Ok(Json(LokiResponse::success(streams)))
 }
 
+async fn index_stats(
+    State(state): State<AppState>,
+    Query(params): Query<StatsQueryParams>,
+) -> Result<Json<IndexStatsResponse>, AppError> {
+    let query = params
+        .query
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("query is required".into()))?;
+    let start = params
+        .start
+        .ok_or_else(|| AppError::BadRequest("start is required".into()))?;
+    let end = params
+        .end
+        .ok_or_else(|| AppError::BadRequest("end is required".into()))?;
+    if start >= end {
+        return Err(AppError::BadRequest(
+            "start must be smaller than end".into(),
+        ));
+    }
+    let expr = state.parse(query)?;
+    let plan = state.schema().build_index_stats_query(
+        state.table(),
+        &expr,
+        &StatsQueryBounds {
+            start_ns: start,
+            end_ns: end,
+        },
+    )?;
+    log::debug!(
+        "index stats SQL (start_ns={}, end_ns={}): {}",
+        start,
+        end,
+        plan.sql
+    );
+    let rows = execute_query(state.client(), &plan.sql).await?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Internal("index stats query returned no rows".into()))?;
+    let stats = parse_index_stats_row(row)?;
+    Ok(Json(stats))
+}
+
 async fn tail_logs(
     State(state): State<AppState>,
     Query(params): Query<TailQueryParams>,
@@ -359,6 +420,52 @@ fn parse_vector_term(segment: &str) -> Option<f64> {
     let inner = &segment[PREFIX.len()..segment.len() - 1];
     let value = inner.trim().parse::<f64>().ok()?;
     Some(value)
+}
+
+fn parse_index_stats_row(row: Row) -> Result<IndexStatsResponse, AppError> {
+    if row.len() < 4 {
+        return Err(AppError::Internal(
+            "index stats query must return streams, chunks, entries, bytes".into(),
+        ));
+    }
+    let values = row.values();
+    let streams = value_to_u64(&values[0], "streams")?;
+    let chunks = value_to_u64(&values[1], "chunks")?;
+    let entries = value_to_u64(&values[2], "entries")?;
+    let bytes = value_to_u64(&values[3], "bytes")?;
+    Ok(IndexStatsResponse {
+        streams,
+        chunks,
+        entries,
+        bytes,
+    })
+}
+
+fn value_to_u64(value: &Value, context: &str) -> Result<u64, AppError> {
+    match value {
+        Value::Null => Ok(0),
+        Value::Number(number) => match number {
+            NumberValue::UInt8(v) => Ok(*v as u64),
+            NumberValue::UInt16(v) => Ok(*v as u64),
+            NumberValue::UInt32(v) => Ok(*v as u64),
+            NumberValue::UInt64(v) => Ok(*v),
+            NumberValue::Int8(v) if *v >= 0 => Ok(*v as u64),
+            NumberValue::Int16(v) if *v >= 0 => Ok(*v as u64),
+            NumberValue::Int32(v) if *v >= 0 => Ok(*v as u64),
+            NumberValue::Int64(v) if *v >= 0 => Ok(*v as u64),
+            NumberValue::Float32(v) if *v >= 0.0 => Ok(v.trunc() as u64),
+            NumberValue::Float64(v) if *v >= 0.0 => Ok(v.trunc() as u64),
+            other => Err(AppError::Internal(format!(
+                "unexpected {context} numeric value: {other:?}"
+            ))),
+        },
+        Value::String(text) => text
+            .parse::<u64>()
+            .map_err(|err| AppError::Internal(format!("failed to parse {context} as u64: {err}"))),
+        other => Err(AppError::Internal(format!(
+            "unexpected {context} value type: {other:?}"
+        ))),
+    }
 }
 
 async fn log_requests(req: Request<Body>, next: Next) -> Response {
