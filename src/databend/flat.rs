@@ -27,11 +27,12 @@ use crate::{
 
 use super::core::{
     LabelQueryBounds, LogEntry, MetricLabelsPlan, MetricQueryBounds, MetricQueryPlan,
-    MetricRangeQueryBounds, MetricRangeQueryPlan, QueryBounds, SchemaConfig, TableColumn, TableRef,
-    aggregate_value_select, ensure_line_column, ensure_timestamp_column, escape, execute_query,
-    format_float_literal, is_line_candidate, is_numeric_type, line_filter_clause,
-    matches_named_column, metric_bucket_cte, missing_required_column, quote_ident,
-    range_bucket_value_expression, timestamp_literal, timestamp_offset_expr, value_to_timestamp,
+    MetricRangeQueryBounds, MetricRangeQueryPlan, QueryBounds, SchemaConfig, StatsQueryBounds,
+    StatsQueryPlan, TableColumn, TableRef, aggregate_value_select, ensure_line_column,
+    ensure_timestamp_column, escape, execute_query, format_float_literal, is_line_candidate,
+    is_numeric_type, line_filter_clause, matches_named_column, metric_bucket_cte,
+    missing_required_column, quote_ident, range_bucket_value_expression, timestamp_literal,
+    timestamp_offset_expr, value_to_timestamp,
 };
 
 #[derive(Clone)]
@@ -231,6 +232,56 @@ impl FlatSchema {
                 &drop_labels,
             ),
         }
+    }
+
+    pub(crate) fn build_index_stats_query(
+        &self,
+        table: &TableRef,
+        expr: &LogqlExpr,
+        bounds: &StatsQueryBounds,
+    ) -> Result<StatsQueryPlan, AppError> {
+        let ts_col = quote_ident(&self.timestamp_col);
+        let mut clauses = vec![
+            format!("{ts_col} >= {}", timestamp_literal(bounds.start_ns)?),
+            format!("{ts_col} <= {}", timestamp_literal(bounds.end_ns)?),
+        ];
+        for matcher in &expr.selectors {
+            clauses.push(label_clause_flat(matcher, &self.label_cols, None)?);
+        }
+        clauses.extend(
+            expr.filters
+                .iter()
+                .map(|f| line_filter_clause(quote_ident(&self.line_col), f)),
+        );
+        let where_clause = clauses.join(" AND ");
+        let stream_expr = self.stream_identity_expr(None);
+        let line_col = quote_ident(&self.line_col);
+        let sql = format!(
+            "SELECT \
+                COUNT(DISTINCT {stream}) AS streams, \
+                COUNT(DISTINCT {stream}) AS chunks, \
+                COUNT(*) AS entries, \
+                COALESCE(SUM(length({line_col})), 0) AS bytes \
+             FROM {table} \
+             WHERE {where_clause}",
+            stream = stream_expr,
+            table = table.fq_name()
+        );
+        Ok(StatsQueryPlan { sql })
+    }
+
+    fn stream_identity_expr(&self, alias: Option<&str>) -> String {
+        if self.label_cols.is_empty() {
+            return "''".to_string();
+        }
+        let qualifier = alias.map(|name| format!("{name}.")).unwrap_or_default();
+        let mut args = Vec::with_capacity(self.label_cols.len() + 1);
+        args.push("'|'".to_string());
+        for column in &self.label_cols {
+            let qualified = format!("{qualifier}{}", quote_ident(&column.name));
+            args.push(format!("COALESCE(CAST({qualified} AS STRING), '')"));
+        }
+        format!("concat_ws({})", args.join(", "))
     }
 
     fn metric_stream_sql(

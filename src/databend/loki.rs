@@ -24,12 +24,12 @@ use crate::{
 
 use super::core::{
     LabelQueryBounds, LogEntry, MetricLabelsPlan, MetricQueryBounds, MetricQueryPlan,
-    MetricRangeQueryBounds, MetricRangeQueryPlan, QueryBounds, SchemaConfig, TableColumn, TableRef,
-    aggregate_value_select, ensure_labels_column, ensure_line_column, ensure_timestamp_column,
-    escape, execute_query, format_float_literal, line_filter_clause, matches_line_column,
-    matches_named_column, metric_bucket_cte, missing_required_column, parse_labels_value,
-    quote_ident, range_bucket_value_expression, timestamp_literal, timestamp_offset_expr,
-    value_to_timestamp,
+    MetricRangeQueryBounds, MetricRangeQueryPlan, QueryBounds, SchemaConfig, StatsQueryBounds,
+    StatsQueryPlan, TableColumn, TableRef, aggregate_value_select, ensure_labels_column,
+    ensure_line_column, ensure_timestamp_column, escape, execute_query, format_float_literal,
+    line_filter_clause, matches_line_column, matches_named_column, metric_bucket_cte,
+    missing_required_column, parse_labels_value, quote_ident, range_bucket_value_expression,
+    timestamp_literal, timestamp_offset_expr, value_to_timestamp,
 };
 
 #[derive(Clone)]
@@ -226,6 +226,44 @@ impl LokiSchema {
                 })
             }
         }
+    }
+
+    pub(crate) fn build_index_stats_query(
+        &self,
+        table: &TableRef,
+        expr: &LogqlExpr,
+        bounds: &StatsQueryBounds,
+    ) -> Result<StatsQueryPlan, AppError> {
+        let ts_col = quote_ident(&self.timestamp_col);
+        let mut clauses = vec![
+            format!("{ts_col} >= {}", timestamp_literal(bounds.start_ns)?),
+            format!("{ts_col} <= {}", timestamp_literal(bounds.end_ns)?),
+        ];
+        clauses.extend(
+            expr.selectors
+                .iter()
+                .map(|m| label_clause_loki(m, quote_ident(&self.labels_col))),
+        );
+        clauses.extend(
+            expr.filters
+                .iter()
+                .map(|f| line_filter_clause(quote_ident(&self.line_col), f)),
+        );
+        let where_clause = clauses.join(" AND ");
+        let labels_col = quote_ident(&self.labels_col);
+        let line_col = quote_ident(&self.line_col);
+        let stream_hash = format!("city64withseed({labels_col}, 0)");
+        let sql = format!(
+            "SELECT \
+                COUNT(DISTINCT {stream_hash}) AS streams, \
+                COUNT(DISTINCT {stream_hash}) AS chunks, \
+                COUNT(*) AS entries, \
+                COALESCE(SUM(length({line_col})), 0) AS bytes \
+             FROM {table} \
+             WHERE {where_clause}",
+            table = table.fq_name()
+        );
+        Ok(StatsQueryPlan { sql })
     }
 
     fn metric_streams_sql(
