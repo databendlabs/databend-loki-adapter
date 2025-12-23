@@ -125,8 +125,20 @@ All endpoints return Loki-compatible JSON responses and reuse the same error sha
 | `GET /loki/api/v1/query_range`          | Range query. Requires `start`/`end` nanoseconds and accepts `limit`/`step`. Log queries stream raw lines; metric queries return Loki matrix results and require `step` to match the range selector duration.          |
 | `GET /loki/api/v1/labels`               | Lists known label keys for the selected schema. Optional `start`/`end` parameters (nanoseconds) fence the search window; unspecified values default to the last 5 minutes, matching Grafana's Explore defaults.     |
 | `GET /loki/api/v1/label/{label}/values` | Lists distinct values for a specific label key using the same optional `start`/`end` bounds as `/labels`. Works for both `loki` and `flat` schemas and automatically filters out empty strings.                     |
+| `GET /loki/api/v1/tail`                 | WebSocket tail endpoint that streams live logs for a LogQL query; compatible with Grafana Explore and `logcli --tail`.                                                                                            |
 
 `/query` and `/query_range` share the same LogQL parser and SQL builder. Instant queries fall back to `DEFAULT_LOOKBACK_NS` (5 minutes) when no explicit window is supplied, while range queries honor the caller's `start`/`end` bounds. `/labels` and `/label/{label}/values` delegate to schema-aware metadata lookups: the loki schema uses `map_keys`/`labels['key']` expressions, whereas the flat schema issues `SELECT DISTINCT` on the physical column and returns values in sorted order.
+
+### Tail streaming
+
+`/loki/api/v1/tail` upgrades to a WebSocket connection and sends frames that match Loki's native shape (`{"streams":[...],"dropped_entries":[]}`). Supported query parameters:
+
+- `query`: required LogQL selector.
+- `limit`: max number of entries per batch (default 100, still subject to the global `MAX_LIMIT`).
+- `start`: initial cursor in nanoseconds, defaults to "one hour ago".
+- `delay_for`: optional delay (seconds) that lets slow writers catch up; defaults to `0` and cannot exceed `5`.
+
+The adapter keeps a cursor and duplicate fingerprints so new rows are streamed in chronological order without repeats. Grafana Explore, `logcli --tail`, or any WebSocket client can connect directly.
 
 ### Metric queries
 

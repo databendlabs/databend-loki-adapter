@@ -15,7 +15,10 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{
+        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::Request,
     middleware::{self, Next},
     response::Response,
@@ -23,7 +26,8 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
+use tokio::time::{Duration, sleep};
 
 use crate::{
     databend::{
@@ -31,13 +35,21 @@ use crate::{
         execute_query,
     },
     error::AppError,
-    logql::DurationValue,
+    logql::{DurationValue, LogqlExpr},
 };
 
 use super::{
-    responses::{LabelsResponse, LokiResponse, metric_matrix, metric_vector, rows_to_streams},
+    responses::{
+        LabelsResponse, LokiResponse, ProcessedEntry, collect_processed_entries,
+        entries_to_streams, metric_matrix, metric_vector, rows_to_streams, tail_chunk,
+    },
     state::{AppState, DEFAULT_LOOKBACK_NS},
 };
+
+const DEFAULT_TAIL_LIMIT: u64 = 100;
+const DEFAULT_TAIL_LOOKBACK_NS: i64 = 60 * 60 * 1_000_000_000;
+const MAX_TAIL_DELAY_SECONDS: u64 = 5;
+const TAIL_IDLE_SLEEP_MS: u64 = 200;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -45,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/label/{label}/values", get(label_values))
         .route("/loki/api/v1/query", get(instant_query))
         .route("/loki/api/v1/query_range", get(range_query))
+        .route("/loki/api/v1/tail", get(tail_logs))
         .with_state(state)
         .layer(middleware::from_fn(log_requests))
 }
@@ -69,6 +82,14 @@ struct RangeQueryParams {
 struct LabelsQueryParams {
     start: Option<i64>,
     end: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailQueryParams {
+    query: String,
+    limit: Option<u64>,
+    start: Option<i64>,
+    delay_for: Option<u64>,
 }
 
 async fn instant_query(
@@ -208,6 +229,18 @@ async fn range_query(
     Ok(Json(LokiResponse::success(streams)))
 }
 
+async fn tail_logs(
+    State(state): State<AppState>,
+    Query(params): Query<TailQueryParams>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    let request = TailRequest::new(&state, params)?;
+    let stream_state = state.clone();
+    Ok(ws.on_upgrade(move |socket| async move {
+        stream_tail(socket, stream_state, request).await;
+    }))
+}
+
 fn parse_step_duration(step_raw: &str) -> Result<DurationValue, AppError> {
     match DurationValue::parse_literal(step_raw) {
         Ok(value) => Ok(value),
@@ -345,9 +378,156 @@ async fn log_requests(req: Request<Body>, next: Next) -> Response {
     response
 }
 
+async fn stream_tail(mut socket: WebSocket, state: AppState, request: TailRequest) {
+    if let Err(err) = tail_loop(&mut socket, state, request).await {
+        log::warn!("tail stream closed: {}", err);
+        let _ = socket.send(Message::Close(None)).await;
+    }
+}
+
+async fn tail_loop(
+    socket: &mut WebSocket,
+    state: AppState,
+    request: TailRequest,
+) -> Result<(), AppError> {
+    let mut cursor = TailCursor::new(request.start_ns);
+    loop {
+        let now = current_time_ns();
+        let target_end_ns = now.saturating_sub(request.delay_ns);
+        if target_end_ns <= cursor.next_start() {
+            sleep(Duration::from_millis(TAIL_IDLE_SLEEP_MS)).await;
+            continue;
+        }
+        let sql = state.schema().build_query(
+            state.table(),
+            &request.expr,
+            &QueryBounds {
+                start_ns: Some(cursor.next_start()),
+                end_ns: Some(target_end_ns),
+                limit: request.limit,
+                order: SqlOrder::Asc,
+            },
+        )?;
+        let rows = execute_query(state.client(), &sql).await?;
+        let entries = collect_processed_entries(state.schema(), rows, &request.expr.pipeline)?;
+        let filtered = filter_tail_entries(&mut cursor, entries)?;
+        if filtered.is_empty() {
+            sleep(Duration::from_millis(TAIL_IDLE_SLEEP_MS)).await;
+            continue;
+        }
+        let streams = entries_to_streams(filtered)?;
+        let payload = serde_json::to_string(&tail_chunk(streams))
+            .map_err(|err| AppError::Internal(format!("failed to encode tail payload: {err}")))?;
+        socket
+            .send(Message::Text(payload.into()))
+            .await
+            .map_err(|err| AppError::Internal(format!("failed to send tail payload: {err}")))?;
+    }
+}
+
+fn filter_tail_entries(
+    cursor: &mut TailCursor,
+    entries: Vec<ProcessedEntry>,
+) -> Result<Vec<ProcessedEntry>, AppError> {
+    let mut accepted = Vec::new();
+    for entry in entries {
+        let ts = i64::try_from(entry.timestamp_ns)
+            .map_err(|_| AppError::Internal("tail timestamp is outside supported range".into()))?;
+        if ts < cursor.next_start() {
+            continue;
+        }
+        let fingerprint = entry_fingerprint(ts, &entry)?;
+        if cursor.accept(ts, fingerprint) {
+            accepted.push(entry);
+        }
+    }
+    Ok(accepted)
+}
+
+fn entry_fingerprint(ts: i64, entry: &ProcessedEntry) -> Result<String, AppError> {
+    let labels = serde_json::to_string(&entry.labels)
+        .map_err(|err| AppError::Internal(format!("failed to encode labels: {err}")))?;
+    Ok(format!("{ts}:{labels}:{}", entry.line))
+}
+
+struct TailCursor {
+    next_start_ns: i64,
+    last_timestamp_ns: Option<i64>,
+    last_fingerprints: HashSet<String>,
+}
+
+impl TailCursor {
+    fn new(start_ns: i64) -> Self {
+        Self {
+            next_start_ns: start_ns,
+            last_timestamp_ns: None,
+            last_fingerprints: HashSet::new(),
+        }
+    }
+
+    fn next_start(&self) -> i64 {
+        self.next_start_ns
+    }
+
+    fn accept(&mut self, ts: i64, fingerprint: String) -> bool {
+        match self.last_timestamp_ns {
+            Some(last) if ts < last => return false,
+            Some(last) if ts > last => {
+                self.last_timestamp_ns = Some(ts);
+                self.last_fingerprints.clear();
+            }
+            None => {
+                self.last_timestamp_ns = Some(ts);
+                self.last_fingerprints.clear();
+            }
+            _ => {}
+        }
+        if !self.last_fingerprints.insert(fingerprint) {
+            return false;
+        }
+        if ts > self.next_start_ns {
+            self.next_start_ns = ts;
+        }
+        true
+    }
+}
+
+struct TailRequest {
+    expr: LogqlExpr,
+    limit: u64,
+    start_ns: i64,
+    delay_ns: i64,
+}
+
+impl TailRequest {
+    fn new(state: &AppState, params: TailQueryParams) -> Result<Self, AppError> {
+        let limit = params.limit.unwrap_or(DEFAULT_TAIL_LIMIT).max(1);
+        let limit = state.clamp_limit(Some(limit));
+        let delay_for = params.delay_for.unwrap_or(0);
+        if delay_for > MAX_TAIL_DELAY_SECONDS {
+            return Err(AppError::BadRequest(format!(
+                "delay_for cannot exceed {} seconds",
+                MAX_TAIL_DELAY_SECONDS
+            )));
+        }
+        let delay_ns = (delay_for as i64) * 1_000_000_000;
+        let start_ns = params
+            .start
+            .unwrap_or_else(|| current_time_ns().saturating_sub(DEFAULT_TAIL_LOOKBACK_NS));
+        let expr = state.parse(&params.query)?;
+        Ok(Self {
+            expr,
+            limit,
+            start_ns,
+            delay_ns,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_constant_vector_expr;
+    use super::{ProcessedEntry, TailCursor, filter_tail_entries, parse_constant_vector_expr};
+    use std::collections::BTreeMap;
 
     #[test]
     fn parse_constant_vector_sum() {
@@ -362,5 +542,49 @@ mod tests {
         assert!(parse_constant_vector_expr("{app=\"loki\"}").is_none());
         assert!(parse_constant_vector_expr("vector(foo)").is_none());
         assert!(parse_constant_vector_expr("vector(1)+sum").is_none());
+    }
+
+    #[test]
+    fn tail_cursor_keeps_latest_timestamp() {
+        let mut cursor = TailCursor::new(0);
+        let mut entry = ProcessedEntry {
+            timestamp_ns: 10,
+            labels: BTreeMap::new(),
+            line: "line1".into(),
+        };
+        assert_eq!(
+            filter_tail_entries(&mut cursor, vec![entry.clone()])
+                .unwrap()
+                .len(),
+            1
+        );
+        entry.line = "line2".into();
+        entry.timestamp_ns = 10;
+        assert_eq!(
+            filter_tail_entries(&mut cursor, vec![entry.clone()])
+                .unwrap()
+                .len(),
+            1
+        );
+        entry.line = "line1".into();
+        assert_eq!(
+            filter_tail_entries(&mut cursor, vec![entry]).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn tail_cursor_skips_older_entries() {
+        let mut cursor = TailCursor::new(50);
+        let entry = ProcessedEntry {
+            timestamp_ns: 40,
+            labels: BTreeMap::new(),
+            line: "old".into(),
+        };
+        assert!(
+            filter_tail_entries(&mut cursor, vec![entry])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

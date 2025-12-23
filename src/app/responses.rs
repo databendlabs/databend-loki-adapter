@@ -28,23 +28,52 @@ pub(crate) fn rows_to_streams(
     rows: Vec<Row>,
     pipeline: &Pipeline,
 ) -> Result<Vec<LokiStream>, AppError> {
-    let mut buckets: BTreeMap<String, StreamBucket> = BTreeMap::new();
+    let entries = collect_processed_entries(schema, rows, pipeline)?;
+    entries_to_streams(entries)
+}
+
+pub(crate) fn collect_processed_entries(
+    schema: &SchemaAdapter,
+    rows: Vec<Row>,
+    pipeline: &Pipeline,
+) -> Result<Vec<ProcessedEntry>, AppError> {
+    let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
         let entry = schema.parse_row(&row)?;
         let processed = pipeline.process(&entry.labels, &entry.line);
-        let key = serde_json::to_string(&processed.labels)
+        entries.push(ProcessedEntry {
+            timestamp_ns: entry.timestamp_ns,
+            labels: processed.labels,
+            line: processed.line,
+        });
+    }
+    Ok(entries)
+}
+
+pub(crate) fn entries_to_streams(
+    entries: Vec<ProcessedEntry>,
+) -> Result<Vec<LokiStream>, AppError> {
+    let mut buckets: BTreeMap<String, StreamBucket> = BTreeMap::new();
+    for entry in entries {
+        let key = serde_json::to_string(&entry.labels)
             .map_err(|err| AppError::Internal(format!("failed to encode labels: {err}")))?;
         let bucket = buckets
             .entry(key)
-            .or_insert_with(|| StreamBucket::new(processed.labels.clone()));
-        bucket.values.push((entry.timestamp_ns, processed.line));
+            .or_insert_with(|| StreamBucket::new(entry.labels.clone()));
+        bucket.values.push((entry.timestamp_ns, entry.line));
     }
-
     let mut result = Vec::with_capacity(buckets.len());
     for bucket in buckets.into_values() {
         result.push(bucket.into_stream());
     }
     Ok(result)
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessedEntry {
+    pub timestamp_ns: i128,
+    pub labels: BTreeMap<String, String>,
+    pub line: String,
 }
 
 pub(crate) fn metric_vector(timestamp_ns: i64, samples: Vec<MetricSample>) -> LokiResponse {
@@ -73,6 +102,26 @@ pub(crate) fn metric_matrix(samples: Vec<MetricMatrixSample>) -> LokiResponse {
         series.push(bucket.into_series());
     }
     LokiResponse::matrix(series)
+}
+
+pub(crate) fn tail_chunk(streams: Vec<LokiStream>) -> TailChunk {
+    TailChunk {
+        streams,
+        dropped_entries: Vec::new(),
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct TailChunk {
+    pub(crate) streams: Vec<LokiStream>,
+    #[serde(rename = "dropped_entries")]
+    pub(crate) dropped_entries: Vec<DroppedEntry>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DroppedEntry {
+    pub(crate) labels: BTreeMap<String, String>,
+    pub(crate) timestamp: String,
 }
 
 struct StreamBucket {
