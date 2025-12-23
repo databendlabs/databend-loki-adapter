@@ -36,6 +36,9 @@ impl Pipeline {
         for stage in &self.stages {
             match stage {
                 PipelineStage::Drop(stage) => labels.extend(stage.targets.iter().cloned()),
+                PipelineStage::LineFormat(_) => {
+                    continue;
+                }
                 _ => {
                     return Err(
                         "metric queries only support `drop` stages inside the selector pipeline"

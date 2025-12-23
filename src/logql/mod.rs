@@ -880,6 +880,15 @@ mod tests {
     }
 
     #[test]
+    fn metric_drop_labels_ignore_line_format() {
+        let expr = LogqlParser
+            .parse("{job=\"api\"} | line_format \"{{.message}}\"")
+            .unwrap();
+        let drops = expr.pipeline.metric_drop_labels().unwrap();
+        assert!(drops.is_empty());
+    }
+
+    #[test]
     fn duration_literal_with_multiple_segments() {
         let value = DurationValue::parse_literal("1h30m15s").unwrap();
         assert_eq!(
