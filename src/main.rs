@@ -25,6 +25,8 @@ mod databend;
 mod error;
 mod logql;
 
+const DEFAULT_MAX_METRIC_BUCKETS: u32 = 240;
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, disable_help_subcommand = true)]
 struct Args {
@@ -54,6 +56,13 @@ struct Args {
     /// Override the column storing labels (loki schema only)
     #[arg(long = "labels-column", env = "LABELS_COLUMN")]
     labels_column: Option<String>,
+    /// Maximum number of buckets per metric range query
+    #[arg(
+        long = "max-metric-buckets",
+        env = "MAX_METRIC_BUCKETS",
+        default_value_t = DEFAULT_MAX_METRIC_BUCKETS
+    )]
+    max_metric_buckets: u32,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -97,6 +106,7 @@ async fn main() -> Result<(), AppError> {
             line_column: args.line_column.clone(),
             labels_column: args.labels_column.clone(),
         },
+        max_metric_buckets: args.max_metric_buckets,
     };
     info!("bootstrapping application state");
     let state = AppState::bootstrap(config).await?;
