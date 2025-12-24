@@ -41,13 +41,15 @@ use crate::{
 
 use super::{
     responses::{
-        LabelsResponse, LokiResponse, ProcessedEntry, collect_processed_entries,
-        entries_to_streams, metric_matrix, metric_vector, rows_to_streams, tail_chunk,
+        LabelsResponse, LokiResponse, ProcessedEntry, StreamDirection, StreamOptions,
+        collect_processed_entries, entries_to_streams, metric_matrix, metric_vector,
+        rows_to_streams, tail_chunk,
     },
     state::{AppState, DEFAULT_LOOKBACK_NS},
 };
 
 const DEFAULT_TAIL_LIMIT: u64 = 100;
+const DEFAULT_RANGE_LOOKBACK_NS: i64 = 60 * 60 * 1_000_000_000;
 const DEFAULT_TAIL_LOOKBACK_NS: i64 = 60 * 60 * 1_000_000_000;
 const MAX_TAIL_DELAY_SECONDS: u64 = 5;
 const TAIL_IDLE_SLEEP_MS: u64 = 200;
@@ -77,7 +79,10 @@ struct RangeQueryParams {
     limit: Option<u64>,
     start: Option<i64>,
     end: Option<i64>,
+    since: Option<String>,
     step: Option<String>,
+    interval: Option<String>,
+    direction: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,7 +167,12 @@ async fn instant_query(
         sql
     );
     let rows = execute_query(state.client(), &sql).await?;
-    let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
+    let streams = rows_to_streams(
+        state.schema(),
+        rows,
+        &expr.pipeline,
+        StreamOptions::default(),
+    )?;
     Ok(Json(LokiResponse::success(streams)))
 }
 
@@ -171,27 +181,23 @@ async fn range_query(
     Query(params): Query<RangeQueryParams>,
 ) -> Result<Json<LokiResponse>, AppError> {
     log::debug!(
-        "range query received: query=`{}` limit={:?} start={:?} end={:?} step={:?}",
+        "range query received: query=`{}` limit={:?} start={:?} end={:?} step={:?} direction={:?}",
         params.query,
         params.limit,
         params.start,
         params.end,
-        params.step
+        params.step,
+        params.direction
     );
-    let start = params
-        .start
-        .ok_or_else(|| AppError::BadRequest("start is required".into()))?;
-    let end = params
-        .end
-        .ok_or_else(|| AppError::BadRequest("end is required".into()))?;
-
-    if start >= end {
-        return Err(AppError::BadRequest(
-            "start must be smaller than end".into(),
-        ));
-    }
+    let (start, end) = resolve_range_bounds(params.start, params.end, params.since.as_deref())?;
+    let interval_ns = parse_optional_duration_ns(params.interval.as_deref(), "interval")?;
 
     if let Some(metric) = state.parse_metric(&params.query)? {
+        if interval_ns.is_some() {
+            return Err(AppError::BadRequest(
+                "metric queries do not support the `interval` parameter".into(),
+            ));
+        }
         let step_raw = params
             .step
             .as_deref()
@@ -226,6 +232,7 @@ async fn range_query(
         return Ok(Json(metric_matrix(samples)));
     }
 
+    let order = parse_range_direction(params.direction.as_deref())?;
     let expr = state.parse(&params.query)?;
 
     let limit = state.clamp_limit(params.limit);
@@ -236,7 +243,7 @@ async fn range_query(
             start_ns: Some(start),
             end_ns: Some(end),
             limit,
-            order: SqlOrder::Asc,
+            order,
         },
     )?;
 
@@ -248,7 +255,12 @@ async fn range_query(
         sql
     );
     let rows = execute_query(state.client(), &sql).await?;
-    let streams = rows_to_streams(state.schema(), rows, &expr.pipeline)?;
+    let stream_options = StreamOptions {
+        direction: StreamDirection::from(order),
+        interval_ns,
+        interval_start_ns: start.into(),
+    };
+    let streams = rows_to_streams(state.schema(), rows, &expr.pipeline, stream_options)?;
     Ok(Json(LokiResponse::success(streams)))
 }
 
@@ -309,12 +321,16 @@ async fn tail_logs(
 }
 
 fn parse_step_duration(step_raw: &str) -> Result<DurationValue, AppError> {
-    match DurationValue::parse_literal(step_raw) {
+    parse_duration_field(step_raw, "step")
+}
+
+fn parse_duration_field(raw: &str, field: &str) -> Result<DurationValue, AppError> {
+    match DurationValue::parse_literal(raw) {
         Ok(value) => Ok(value),
-        Err(literal_err) => match parse_numeric_step_seconds(step_raw) {
+        Err(literal_err) => match parse_numeric_step_seconds(raw) {
             Ok(value) => Ok(value),
             Err(numeric_err) => Err(AppError::BadRequest(format!(
-                "invalid step duration `{step_raw}`: {literal_err}; {numeric_err}"
+                "invalid {field} `{raw}`: {literal_err}; {numeric_err}"
             ))),
         },
     }
@@ -344,6 +360,55 @@ fn parse_numeric_step_seconds(step_raw: &str) -> Result<DurationValue, String> {
     let nanos = nanos.round() as i64;
     DurationValue::new(nanos)
         .map_err(|err| format!("failed to convert numeric seconds to duration: {err}"))
+}
+
+fn parse_optional_duration_ns(raw: Option<&str>, field: &str) -> Result<Option<i64>, AppError> {
+    raw.map(|text| parse_duration_field(text, field).map(|value| value.as_nanoseconds()))
+        .transpose()
+}
+
+fn parse_range_direction(raw: Option<&str>) -> Result<SqlOrder, AppError> {
+    match raw {
+        None => Ok(SqlOrder::Desc),
+        Some(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "forward" => Ok(SqlOrder::Asc),
+                "backward" => Ok(SqlOrder::Desc),
+                "" => Err(AppError::BadRequest(
+                    "direction must be `forward` or `backward`".into(),
+                )),
+                _ => Err(AppError::BadRequest(format!(
+                    "direction must be `forward` or `backward`, got `{}`",
+                    text
+                ))),
+            }
+        }
+    }
+}
+
+fn resolve_range_bounds(
+    start_param: Option<i64>,
+    end_param: Option<i64>,
+    since_param: Option<&str>,
+) -> Result<(i64, i64), AppError> {
+    let now = current_time_ns();
+    let end_ns = end_param.unwrap_or(now);
+    let since_ns = parse_optional_duration_ns(since_param, "since")?;
+    let start_ns = if let Some(start) = start_param {
+        start
+    } else if let Some(since_ns) = since_ns {
+        let anchor = if end_ns > now { now } else { end_ns };
+        anchor.saturating_sub(since_ns)
+    } else {
+        end_ns.saturating_sub(DEFAULT_RANGE_LOOKBACK_NS)
+    };
+    if start_ns >= end_ns {
+        return Err(AppError::BadRequest(
+            "start must be smaller than end".into(),
+        ));
+    }
+    Ok((start_ns, end_ns))
 }
 
 fn clamp_metric_step_ns(range_ns: i64, requested_step_ns: i64, max_buckets: i64) -> i64 {
@@ -538,7 +603,7 @@ async fn tail_loop(
             sleep(Duration::from_millis(TAIL_IDLE_SLEEP_MS)).await;
             continue;
         }
-        let streams = entries_to_streams(filtered)?;
+        let streams = entries_to_streams(filtered, StreamOptions::default())?;
         let payload = serde_json::to_string(&tail_chunk(streams))
             .map_err(|err| AppError::Internal(format!("failed to encode tail payload: {err}")))?;
         socket
@@ -650,9 +715,11 @@ impl TailRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessedEntry, TailCursor, clamp_metric_step_ns, filter_tail_entries,
-        parse_constant_vector_expr,
+        DEFAULT_RANGE_LOOKBACK_NS, ProcessedEntry, TailCursor, clamp_metric_step_ns,
+        current_time_ns, filter_tail_entries, parse_constant_vector_expr,
+        parse_optional_duration_ns, parse_range_direction, resolve_range_bounds,
     };
+    use crate::databend::SqlOrder;
     use std::collections::BTreeMap;
 
     #[test]
@@ -739,5 +806,52 @@ mod tests {
         assert_eq!(clamp_metric_step_ns(0, 1_000_000, 600), 1_000_000);
         assert_eq!(clamp_metric_step_ns(-10, 1_000_000, 600), 1_000_000);
         assert_eq!(clamp_metric_step_ns(1_000, 0, 600), 0);
+    }
+
+    #[test]
+    fn range_direction_defaults_to_backward() {
+        assert_eq!(parse_range_direction(None).unwrap(), SqlOrder::Desc);
+    }
+
+    #[test]
+    fn range_direction_accepts_forward() {
+        assert_eq!(
+            parse_range_direction(Some("FORWARD")).unwrap(),
+            SqlOrder::Asc
+        );
+        assert_eq!(
+            parse_range_direction(Some(" backward ")).unwrap(),
+            SqlOrder::Desc
+        );
+    }
+
+    #[test]
+    fn range_direction_rejects_invalid() {
+        assert!(parse_range_direction(Some("")).is_err());
+        assert!(parse_range_direction(Some("sideways")).is_err());
+    }
+
+    #[test]
+    fn resolves_range_bounds_with_defaults() {
+        let (start, end) = resolve_range_bounds(None, None, None).unwrap();
+        let now = current_time_ns();
+        assert!(end <= now);
+        assert_eq!(end - start, DEFAULT_RANGE_LOOKBACK_NS);
+    }
+
+    #[test]
+    fn resolves_range_bounds_with_since() {
+        let (start, end) = resolve_range_bounds(None, Some(2_000_000_000), Some("1s")).unwrap();
+        assert_eq!(end, 2_000_000_000);
+        assert_eq!(start, 1_000_000_000);
+    }
+
+    #[test]
+    fn parse_optional_duration_handles_invalid_input() {
+        assert!(parse_optional_duration_ns(Some("foo"), "interval").is_err());
+        assert_eq!(
+            parse_optional_duration_ns(Some("2s"), "interval").unwrap(),
+            Some(2_000_000_000)
+        );
     }
 }

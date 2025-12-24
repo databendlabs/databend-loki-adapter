@@ -208,7 +208,7 @@ pub struct LabelQueryBounds {
     pub end_ns: Option<i64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqlOrder {
     Asc,
     Desc,

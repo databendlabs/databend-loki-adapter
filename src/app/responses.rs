@@ -18,18 +18,51 @@ use databend_driver::Row;
 use serde::Serialize;
 
 use crate::{
-    databend::{MetricMatrixSample, MetricSample, SchemaAdapter},
+    databend::{MetricMatrixSample, MetricSample, SchemaAdapter, SqlOrder},
     error::AppError,
     logql::Pipeline,
 };
+
+#[derive(Clone, Copy)]
+pub(crate) enum StreamDirection {
+    Forward,
+    Backward,
+}
+
+impl From<SqlOrder> for StreamDirection {
+    fn from(value: SqlOrder) -> Self {
+        match value {
+            SqlOrder::Asc => StreamDirection::Forward,
+            SqlOrder::Desc => StreamDirection::Backward,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StreamOptions {
+    pub direction: StreamDirection,
+    pub interval_ns: Option<i64>,
+    pub interval_start_ns: i128,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self {
+            direction: StreamDirection::Forward,
+            interval_ns: None,
+            interval_start_ns: 0,
+        }
+    }
+}
 
 pub(crate) fn rows_to_streams(
     schema: &SchemaAdapter,
     rows: Vec<Row>,
     pipeline: &Pipeline,
+    options: StreamOptions,
 ) -> Result<Vec<LokiStream>, AppError> {
     let entries = collect_processed_entries(schema, rows, pipeline)?;
-    entries_to_streams(entries)
+    entries_to_streams(entries, options)
 }
 
 pub(crate) fn collect_processed_entries(
@@ -52,6 +85,7 @@ pub(crate) fn collect_processed_entries(
 
 pub(crate) fn entries_to_streams(
     entries: Vec<ProcessedEntry>,
+    options: StreamOptions,
 ) -> Result<Vec<LokiStream>, AppError> {
     let mut buckets: BTreeMap<String, StreamBucket> = BTreeMap::new();
     for entry in entries {
@@ -64,7 +98,7 @@ pub(crate) fn entries_to_streams(
     }
     let mut result = Vec::with_capacity(buckets.len());
     for bucket in buckets.into_values() {
-        result.push(bucket.into_stream());
+        result.push(bucket.into_stream(&options));
     }
     Ok(result)
 }
@@ -137,13 +171,28 @@ impl StreamBucket {
         }
     }
 
-    fn into_stream(mut self) -> LokiStream {
+    fn into_stream(mut self, options: &StreamOptions) -> LokiStream {
         self.values.sort_by_key(|(ts, _)| *ts);
-        let values = self
-            .values
-            .into_iter()
-            .map(|(ts, line)| [ts.to_string(), line])
-            .collect();
+        let values = if let Some(interval_ns) = options.interval_ns {
+            let mut filtered = Vec::with_capacity(self.values.len());
+            let step = i128::from(interval_ns.max(1));
+            let mut next_allowed = options.interval_start_ns;
+            for (ts, line) in self.values.into_iter() {
+                if ts < next_allowed {
+                    continue;
+                }
+                filtered.push((ts, line));
+                next_allowed = ts.saturating_add(step);
+            }
+            filtered
+        } else {
+            self.values
+        };
+        let iter: Box<dyn Iterator<Item = (i128, String)>> = match options.direction {
+            StreamDirection::Forward => Box::new(values.into_iter()),
+            StreamDirection::Backward => Box::new(values.into_iter().rev()),
+        };
+        let values = iter.map(|(ts, line)| [ts.to_string(), line]).collect();
         LokiStream {
             stream: self.labels,
             values,
