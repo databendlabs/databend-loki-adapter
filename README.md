@@ -22,7 +22,7 @@ The adapter listens on `--bind` (default `0.0.0.0:3100`) and exposes a minimal s
 | `--timestamp-column` | `TIMESTAMP_COLUMN` | auto-detect             | Override the timestamp column name.                               |
 | `--line-column`      | `LINE_COLUMN`      | auto-detect             | Override the log line column name.                                |
 | `--labels-column`    | `LABELS_COLUMN`    | auto-detect (loki only) | Override the labels column name.                                  |
-| `--max-metric-buckets` | `MAX_METRIC_BUCKETS` | `600`                 | Maximum bucket count per metric range query before clamping `step`. |
+| `--max-metric-buckets` | `MAX_METRIC_BUCKETS` | `240`                 | Maximum bucket count per metric range query before clamping `step`. |
 
 ## Schema Support
 
@@ -123,7 +123,7 @@ All endpoints return Loki-compatible JSON responses and reuse the same error sha
 | Endpoint                                | Description                                                                                                                                                                                                         |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /loki/api/v1/query`                | Instant query. Supports the same LogQL used by Grafana's Explore panel. An optional `time` parameter (nanoseconds) defaults to "now", and the adapter automatically looks back 5 minutes when computing SQL bounds. |
-| `GET /loki/api/v1/query_range`          | Range query. Requires `start`/`end` nanoseconds and accepts `limit`/`step`. Log queries stream raw lines; metric queries return Loki matrix results and require a `step` value (the adapter may clamp it to keep bucket counts bounded, default cap 600 buckets).          |
+| `GET /loki/api/v1/query_range`          | Range query. Requires `start`/`end` nanoseconds and accepts `limit`/`step`. Log queries stream raw lines; metric queries return Loki matrix results and require a `step` value (the adapter may clamp it to keep bucket counts bounded, default cap 240 buckets).          |
 | `GET /loki/api/v1/labels`               | Lists known label keys for the selected schema. Optional `start`/`end` parameters (nanoseconds) fence the search window; unspecified values default to the last 5 minutes, matching Grafana's Explore defaults.     |
 | `GET /loki/api/v1/label/{label}/values` | Lists distinct values for a specific label key using the same optional `start`/`end` bounds as `/labels`. Works for both `loki` and `flat` schemas and automatically filters out empty strings.                     |
 | `GET /loki/api/v1/index/stats`          | Returns approximate `streams`, `chunks`, `entries`, and `bytes` counters for a selector over a `[start, end]` window. `chunks` are estimated via unique stream keys because Databend does not store Loki chunks.    |
@@ -149,7 +149,7 @@ The adapter currently supports a narrow LogQL metric surface area:
 - Range functions: `count_over_time` and `rate`. The latter reports per-second values (`COUNT / window_seconds`).
 - Optional outer aggregations: `sum`, `avg`, `min`, `max`, `count`, each with `by (...)`. `without` or other modifiers return `errorType:bad_data`.
 - Pipelines: only `drop` stages are honored (labels are removed after aggregation to match Loki semantics). Any other stage still results in `errorType:bad_data`.
-- `/loki/api/v1/query_range` metric calls must provide `step`. When the requested `(end - start) / step` would exceed the configured bucket cap (default 600, tweak via `--max-metric-buckets`), the adapter automatically increases the effective step to keep the SQL result size manageable; the adapter never fans out multiple queries or aggregates in memory.
+- `/loki/api/v1/query_range` metric calls must provide `step`. When the requested `(end - start) / step` would exceed the configured bucket cap (default 240, tweak via `--max-metric-buckets`), the adapter automatically increases the effective step to keep the SQL result size manageable; the adapter never fans out multiple queries or aggregates in memory.
 - `/loki/api/v1/query` metric calls reuse the same expressions but evaluate them over `[time - range, time]`.
 
 Both schema adapters (loki VARIANT labels and flat wide tables) translate the metric expression into one SQL statement that joins generated buckets with the raw rows via `generate_series`, so all aggregation happens inside Databend. Non-metric queries continue to stream raw logs.

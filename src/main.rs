@@ -25,7 +25,7 @@ mod databend;
 mod error;
 mod logql;
 
-const DEFAULT_MAX_METRIC_BUCKETS: u32 = 600;
+const DEFAULT_MAX_METRIC_BUCKETS: u32 = 240;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, disable_help_subcommand = true)]
