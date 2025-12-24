@@ -34,6 +34,7 @@ pub struct AppState {
     table: TableRef,
     parser: LogqlParser,
     schema: SchemaAdapter,
+    max_metric_buckets: i64,
 }
 
 impl AppState {
@@ -43,6 +44,7 @@ impl AppState {
             table,
             schema_type,
             schema_config,
+            max_metric_buckets,
         } = config;
         info!("resolving table reference for `{table}`");
         let table = resolve_table_ref(&dsn, &table)?;
@@ -65,6 +67,7 @@ impl AppState {
             table,
             parser: LogqlParser,
             schema,
+            max_metric_buckets: i64::from(max_metric_buckets.max(1)),
         })
     }
 
@@ -78,6 +81,10 @@ impl AppState {
 
     pub fn schema(&self) -> &SchemaAdapter {
         &self.schema
+    }
+
+    pub fn max_metric_buckets(&self) -> i64 {
+        self.max_metric_buckets
     }
 
     pub fn parse(&self, query: &str) -> Result<LogqlExpr, AppError> {
@@ -117,6 +124,7 @@ pub struct AppConfig {
     pub table: String,
     pub schema_type: SchemaType,
     pub schema_config: SchemaConfig,
+    pub max_metric_buckets: u32,
 }
 
 async fn verify_connection(client: &Client) -> Result<(), AppError> {

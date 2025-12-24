@@ -197,12 +197,18 @@ async fn range_query(
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("step is required for metric queries".into()))?;
         let step_duration = parse_step_duration(step_raw)?;
-        let step_ns = step_duration.as_nanoseconds();
+        let requested_step_ns = step_duration.as_nanoseconds();
         let window_ns = metric.range.duration.as_nanoseconds();
-        if step_ns != window_ns {
-            return Err(AppError::BadRequest(
-                "metric range queries require step to match the range selector duration".into(),
-            ));
+        let range_ns = end - start;
+        let step_ns = clamp_metric_step_ns(range_ns, requested_step_ns, state.max_metric_buckets());
+        if step_ns != requested_step_ns {
+            log::info!(
+                "metric step clamped to limit buckets: range={:.3}s requested_step={:.3}s effective_step={:.3}s max_buckets={}",
+                (range_ns as f64) / 1_000_000_000_f64,
+                (requested_step_ns as f64) / 1_000_000_000_f64,
+                (step_ns as f64) / 1_000_000_000_f64,
+                state.max_metric_buckets()
+            );
         }
         let plan = state.schema().build_metric_range_query(
             state.table(),
@@ -338,6 +344,16 @@ fn parse_numeric_step_seconds(step_raw: &str) -> Result<DurationValue, String> {
     let nanos = nanos.round() as i64;
     DurationValue::new(nanos)
         .map_err(|err| format!("failed to convert numeric seconds to duration: {err}"))
+}
+
+fn clamp_metric_step_ns(range_ns: i64, requested_step_ns: i64, max_buckets: i64) -> i64 {
+    if range_ns <= 0 || requested_step_ns <= 0 {
+        return requested_step_ns;
+    }
+    let max_buckets = max_buckets.max(1);
+    let numerator = i128::from(range_ns) + i128::from(max_buckets - 1);
+    let min_step_ns = (numerator / i128::from(max_buckets)) as i64;
+    requested_step_ns.max(min_step_ns.max(1))
 }
 
 async fn label_names(
@@ -633,7 +649,10 @@ impl TailRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcessedEntry, TailCursor, filter_tail_entries, parse_constant_vector_expr};
+    use super::{
+        ProcessedEntry, TailCursor, clamp_metric_step_ns, filter_tail_entries,
+        parse_constant_vector_expr,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -693,5 +712,32 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn clamps_when_bucket_count_exceeds_limit() {
+        let range_ns = 3_600_000_000_000;
+        let requested_step_ns = 1_000_000_000;
+        assert_eq!(
+            clamp_metric_step_ns(range_ns, requested_step_ns, 600),
+            6_000_000_000
+        );
+    }
+
+    #[test]
+    fn leaves_large_steps_unchanged() {
+        let range_ns = 10_800_000_000_000;
+        let requested_step_ns = 60_000_000_000;
+        assert_eq!(
+            clamp_metric_step_ns(range_ns, requested_step_ns, 600),
+            requested_step_ns
+        );
+    }
+
+    #[test]
+    fn handles_zero_or_negative_ranges() {
+        assert_eq!(clamp_metric_step_ns(0, 1_000_000, 600), 1_000_000);
+        assert_eq!(clamp_metric_step_ns(-10, 1_000_000, 600), 1_000_000);
+        assert_eq!(clamp_metric_step_ns(1_000, 0, 600), 0);
     }
 }
