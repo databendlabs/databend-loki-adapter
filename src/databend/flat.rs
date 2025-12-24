@@ -92,7 +92,12 @@ impl FlatSchema {
 
         let mut selected = Vec::with_capacity(self.label_cols.len() + 2);
         selected.push(format!("{} AS ts_col", ts_col));
-        selected.push(format!("{} AS line_col", line_col));
+        let line_source = expr
+            .pipeline
+            .pushdown_line_field()
+            .and_then(|field| self.resolve_field_column(field))
+            .unwrap_or_else(|| line_col.clone());
+        selected.push(format!("{line_source} AS line_col"));
         for col in &self.label_cols {
             selected.push(quote_ident(&col.name));
         }
@@ -739,6 +744,23 @@ impl FlatSchema {
             line_col: line.name,
             label_cols,
         })
+    }
+}
+
+impl FlatSchema {
+    fn resolve_field_column(&self, field: &str) -> Option<String> {
+        if field.eq_ignore_ascii_case(&self.timestamp_col) {
+            return Some(quote_ident(&self.timestamp_col));
+        }
+        if field.eq_ignore_ascii_case(&self.line_col) {
+            return Some(quote_ident(&self.line_col));
+        }
+        for column in &self.label_cols {
+            if field.eq_ignore_ascii_case(&column.name) {
+                return Some(quote_ident(&column.name));
+            }
+        }
+        None
     }
 }
 
