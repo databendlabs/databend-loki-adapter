@@ -40,7 +40,7 @@ pub(crate) fn collect_processed_entries(
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
         let entry = schema.parse_row(&row)?;
-        let processed = pipeline.process(&entry.labels, &entry.line);
+        let processed = pipeline.process(&entry.labels, &entry.line, entry.timestamp_ns);
         entries.push(ProcessedEntry {
             timestamp_ns: entry.timestamp_ns,
             labels: processed.labels,

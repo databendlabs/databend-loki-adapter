@@ -11,7 +11,11 @@ clippy:
 lint: fmt clippy
 
 test:
-	$(CARGO) test --all-features -- --nocapture
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		$(CARGO) nextest run --all-features; \
+	else \
+		$(CARGO) test --all-features -- --nocapture; \
+	fi
 
 build:
 	$(CARGO) build --all-features

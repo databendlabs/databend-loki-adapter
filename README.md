@@ -153,6 +153,38 @@ The adapter currently supports a narrow LogQL metric surface area:
 
 Both schema adapters (loki VARIANT labels and flat wide tables) translate the metric expression into one SQL statement that joins generated buckets with the raw rows via `generate_series`, so all aggregation happens inside Databend. Non-metric queries continue to stream raw logs.
 
+## LogQL template functions
+
+`line_format` and `label_format` now ship with a lightweight template engine that supports field interpolation (`{{ .message }}`) plus the full set of [Grafana Loki template string functions](https://grafana.com/docs/loki/latest/query/template_functions/). Supported functions are listed below:
+
+| Function | Status | Notes |
+| --- | --- | --- |
+| `__line__`, `__timestamp__`, `now` | ✅ | Expose the raw line, the row timestamp, and the adapter host's current time. |
+| `date`, `toDate`, `toDateInZone` | ✅ | Go-style datetime formatting and parsing (supports IANA zones). |
+| `duration`, `duration_seconds` | ✅ | Parse Go duration strings into seconds (positive/negative). |
+| `unixEpoch`, `unixEpochMillis`, `unixEpochNanos`, `unixToTime` | ✅ | Unix timestamp helpers. |
+| `alignLeft`, `alignRight` | ✅ | Align field contents to a fixed width. |
+| `b64enc`, `b64dec` | ✅ | Base64 encode/decode a field or literal. |
+| `bytes` | ✅ | Parses human-readable byte strings (e.g. `2 KB` → `2000`). |
+| `default` | ✅ | Provides a fallback when a field is empty or missing. |
+| `fromJson` | ⚠️ | Validates and normalizes JSON strings (advanced loops like `range` remain unsupported). |
+| `indent`, `nindent` | ✅ | Indent multi-line strings. |
+| `lower`, `upper`, `title` | ✅ | Case conversion helpers. |
+| `repeat` | ✅ | String repetition helper. |
+| `printf` | ✅ | Supports `%s`, `%d`, `%f`, width/precision flags. |
+| `replace`, `substr`, `trunc` | ✅ | String replacement, slicing, and truncation. |
+| `trim`, `trimAll`, `trimPrefix`, `trimSuffix` | ✅ | String trimming helpers. |
+| `urlencode`, `urldecode` | ✅ | URL encoding/decoding. |
+| `contains`, `eq`, `hasPrefix`, `hasSuffix` | ✅ | Logical helpers for comparisons. |
+| `int`, `float64` | ✅ | Cast values to integers/floats. |
+| `add`, `addf`, `sub`, `subf`, `mul`, `mulf`, `div`, `divf`, `mod` | ✅ | Integer and floating-point arithmetic. |
+| `ceil`, `floor`, `round` | ✅ | Floating-point rounding helpers. |
+| `max`, `min`, `maxf`, `minf` | ✅ | Extremum helpers for integers/floats. |
+| `count` | ✅ | Count regex matches (`{{ __line__ | count "foo" }}`). |
+| `regexReplaceAll`, `regexReplaceAllLiteral` | ✅ | Regex replacement helpers (literal and capture-aware). |
+
+`fromJson` currently only validates and re-serializes JSON strings because the template engine has no looping constructs yet. For advanced constructs (e.g., `range`), preprocess data upstream or continue to rely on Grafana/Loki-native features until control flow support arrives.
+
 ## Logging
 
 By default the adapter configures `env_logger` with `databend_loki_adapter` at `info` level and every other module at `warn`. This keeps the startup flow visible without flooding the console with dependency logs. To override the levels, set `RUST_LOG` just like any other `env_logger` application, e.g.:
