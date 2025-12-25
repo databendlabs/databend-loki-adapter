@@ -1,6 +1,6 @@
 [package]
 name = "databend-loki-adapter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Loki-compatible HTTP adapter that runs LogQL queries against Databend"
 license = "Apache-2.0"
