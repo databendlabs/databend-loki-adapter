@@ -19,7 +19,7 @@ use axum::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::Request,
+    http::{HeaderMap, Request},
     middleware::{self, Next},
     response::Response,
     routing::get,
@@ -45,7 +45,7 @@ use super::{
         collect_processed_entries, entries_to_streams, metric_matrix, metric_vector,
         rows_to_streams, tail_chunk,
     },
-    state::{AppState, DEFAULT_LOOKBACK_NS},
+    state::{AppState, DEFAULT_LOOKBACK_NS, RequestContext},
 };
 
 const DEFAULT_TAIL_LIMIT: u64 = 100;
@@ -116,6 +116,7 @@ struct IndexStatsResponse {
 
 async fn instant_query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<InstantQueryParams>,
 ) -> Result<Json<LokiResponse>, AppError> {
     let target_ns = params.time.unwrap_or_else(current_time_ns);
@@ -125,14 +126,15 @@ async fn instant_query(
         params.limit,
         target_ns
     );
+    let adapter = state.resolve_request(&headers)?;
     if let Some(response) = try_constant_vector(&params.query, target_ns) {
         return Ok(Json(response));
     }
     if let Some(metric) = state.parse_metric(&params.query)? {
         let duration_ns = metric.range.duration.as_nanoseconds();
         let start_ns = target_ns.saturating_sub(duration_ns);
-        let plan = state.schema().build_metric_query(
-            state.table(),
+        let plan = adapter.schema().build_metric_query(
+            adapter.table(),
             &metric,
             &MetricQueryBounds {
                 start_ns,
@@ -140,16 +142,16 @@ async fn instant_query(
             },
         )?;
         log::debug!("instant metric SQL: {}", plan.sql);
-        let rows = execute_query(state.client(), &plan.sql).await?;
-        let samples = state.schema().parse_metric_rows(rows, &plan)?;
+        let rows = execute_query(adapter.client(), &plan.sql).await?;
+        let samples = adapter.schema().parse_metric_rows(rows, &plan)?;
         return Ok(Json(metric_vector(target_ns, samples)));
     }
     let expr = state.parse(&params.query)?;
     let start_ns = target_ns.saturating_sub(DEFAULT_LOOKBACK_NS);
     let limit = state.clamp_limit(params.limit);
 
-    let sql = state.schema().build_query(
-        state.table(),
+    let sql = adapter.schema().build_query(
+        adapter.table(),
         &expr,
         &QueryBounds {
             start_ns: Some(start_ns),
@@ -166,9 +168,9 @@ async fn instant_query(
         limit,
         sql
     );
-    let rows = execute_query(state.client(), &sql).await?;
+    let rows = execute_query(adapter.client(), &sql).await?;
     let streams = rows_to_streams(
-        state.schema(),
+        adapter.schema(),
         rows,
         &expr.pipeline,
         StreamOptions::default(),
@@ -178,6 +180,7 @@ async fn instant_query(
 
 async fn range_query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<RangeQueryParams>,
 ) -> Result<Json<LokiResponse>, AppError> {
     log::debug!(
@@ -191,6 +194,7 @@ async fn range_query(
     );
     let (start, end) = resolve_range_bounds(params.start, params.end, params.since.as_deref())?;
     let interval_ns = parse_optional_duration_ns(params.interval.as_deref(), "interval")?;
+    let adapter = state.resolve_request(&headers)?;
 
     if let Some(metric) = state.parse_metric(&params.query)? {
         if interval_ns.is_some() {
@@ -216,8 +220,8 @@ async fn range_query(
                 state.max_metric_buckets()
             );
         }
-        let plan = state.schema().build_metric_range_query(
-            state.table(),
+        let plan = adapter.schema().build_metric_range_query(
+            adapter.table(),
             &metric,
             &MetricRangeQueryBounds {
                 start_ns: start,
@@ -227,8 +231,8 @@ async fn range_query(
             },
         )?;
         log::debug!("range metric SQL: {}", plan.sql);
-        let rows = execute_query(state.client(), &plan.sql).await?;
-        let samples = state.schema().parse_metric_matrix_rows(rows, &plan)?;
+        let rows = execute_query(adapter.client(), &plan.sql).await?;
+        let samples = adapter.schema().parse_metric_matrix_rows(rows, &plan)?;
         return Ok(Json(metric_matrix(samples)));
     }
 
@@ -236,8 +240,8 @@ async fn range_query(
     let expr = state.parse(&params.query)?;
 
     let limit = state.clamp_limit(params.limit);
-    let sql = state.schema().build_query(
-        state.table(),
+    let sql = adapter.schema().build_query(
+        adapter.table(),
         &expr,
         &QueryBounds {
             start_ns: Some(start),
@@ -254,18 +258,19 @@ async fn range_query(
         limit,
         sql
     );
-    let rows = execute_query(state.client(), &sql).await?;
+    let rows = execute_query(adapter.client(), &sql).await?;
     let stream_options = StreamOptions {
         direction: StreamDirection::from(order),
         interval_ns,
         interval_start_ns: start.into(),
     };
-    let streams = rows_to_streams(state.schema(), rows, &expr.pipeline, stream_options)?;
+    let streams = rows_to_streams(adapter.schema(), rows, &expr.pipeline, stream_options)?;
     Ok(Json(LokiResponse::success(streams)))
 }
 
 async fn index_stats(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<StatsQueryParams>,
 ) -> Result<Json<IndexStatsResponse>, AppError> {
     let query = params
@@ -284,9 +289,10 @@ async fn index_stats(
             "start must be smaller than end".into(),
         ));
     }
+    let adapter = state.resolve_request(&headers)?;
     let expr = state.parse(query)?;
-    let plan = state.schema().build_index_stats_query(
-        state.table(),
+    let plan = adapter.schema().build_index_stats_query(
+        adapter.table(),
         &expr,
         &StatsQueryBounds {
             start_ns: start,
@@ -299,7 +305,7 @@ async fn index_stats(
         end,
         plan.sql
     );
-    let rows = execute_query(state.client(), &plan.sql).await?;
+    let rows = execute_query(adapter.client(), &plan.sql).await?;
     let row = rows
         .into_iter()
         .next()
@@ -310,13 +316,14 @@ async fn index_stats(
 
 async fn tail_logs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<TailQueryParams>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
+    let adapter = state.resolve_request(&headers)?;
     let request = TailRequest::new(&state, params)?;
-    let stream_state = state.clone();
     Ok(ws.on_upgrade(move |socket| async move {
-        stream_tail(socket, stream_state, request).await;
+        stream_tail(socket, adapter, request).await;
     }))
 }
 
@@ -423,6 +430,7 @@ fn clamp_metric_step_ns(range_ns: i64, requested_step_ns: i64, max_buckets: i64)
 
 async fn label_names(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<LabelsQueryParams>,
 ) -> Result<Json<LabelsResponse>, AppError> {
     let now = current_time_ns();
@@ -439,7 +447,8 @@ async fn label_names(
         start_ns: Some(start),
         end_ns: Some(end),
     };
-    let mut labels = state.list_labels(bounds).await?;
+    let adapter = state.resolve_request(&headers)?;
+    let mut labels = adapter.list_labels(bounds).await?;
     labels.sort();
     labels.dedup();
     Ok(Json(LabelsResponse::success(labels)))
@@ -447,6 +456,7 @@ async fn label_names(
 
 async fn label_values(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(label): Path<String>,
     Query(params): Query<LabelsQueryParams>,
 ) -> Result<Json<LabelsResponse>, AppError> {
@@ -464,7 +474,8 @@ async fn label_values(
         start_ns: Some(start),
         end_ns: Some(end),
     };
-    let mut values = state.list_label_values(&label, bounds).await?;
+    let adapter = state.resolve_request(&headers)?;
+    let mut values = adapter.list_label_values(&label, bounds).await?;
     values.sort();
     values.dedup();
     Ok(Json(LabelsResponse::success(values)))
@@ -566,8 +577,8 @@ async fn log_requests(req: Request<Body>, next: Next) -> Response {
     response
 }
 
-async fn stream_tail(mut socket: WebSocket, state: AppState, request: TailRequest) {
-    if let Err(err) = tail_loop(&mut socket, state, request).await {
+async fn stream_tail(mut socket: WebSocket, adapter: RequestContext, request: TailRequest) {
+    if let Err(err) = tail_loop(&mut socket, adapter, request).await {
         log::warn!("tail stream closed: {}", err);
         let _ = socket.send(Message::Close(None)).await;
     }
@@ -575,7 +586,7 @@ async fn stream_tail(mut socket: WebSocket, state: AppState, request: TailReques
 
 async fn tail_loop(
     socket: &mut WebSocket,
-    state: AppState,
+    adapter: RequestContext,
     request: TailRequest,
 ) -> Result<(), AppError> {
     let mut cursor = TailCursor::new(request.start_ns);
@@ -586,8 +597,8 @@ async fn tail_loop(
             sleep(Duration::from_millis(TAIL_IDLE_SLEEP_MS)).await;
             continue;
         }
-        let sql = state.schema().build_query(
-            state.table(),
+        let sql = adapter.schema().build_query(
+            adapter.table(),
             &request.expr,
             &QueryBounds {
                 start_ns: Some(cursor.next_start()),
@@ -596,8 +607,8 @@ async fn tail_loop(
                 order: SqlOrder::Asc,
             },
         )?;
-        let rows = execute_query(state.client(), &sql).await?;
-        let entries = collect_processed_entries(state.schema(), rows, &request.expr.pipeline)?;
+        let rows = execute_query(adapter.client(), &sql).await?;
+        let entries = collect_processed_entries(adapter.schema(), rows, &request.expr.pipeline)?;
         let filtered = filter_tail_entries(&mut cursor, entries)?;
         if filtered.is_empty() {
             sleep(Duration::from_millis(TAIL_IDLE_SLEEP_MS)).await;

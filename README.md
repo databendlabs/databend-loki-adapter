@@ -13,16 +13,65 @@ The adapter listens on `--bind` (default `0.0.0.0:3100`) and exposes a minimal s
 
 ## Configuration
 
-| Flag                 | Env                | Default                 | Description                                                       |
-| -------------------- | ------------------ | ----------------------- | ----------------------------------------------------------------- |
-| `--dsn`              | `DATABEND_DSN`     | _required_              | Databend DSN with credentials and optional default database.      |
-| `--table`            | `LOGS_TABLE`       | `logs`                  | Target table. Use `db.table` or rely on the DSN default database. |
-| `--bind`             | `BIND_ADDR`        | `0.0.0.0:3100`          | HTTP bind address.                                                |
-| `--schema-type`      | `SCHEMA_TYPE`      | `loki`                  | `loki` (labels as VARIANT) or `flat` (wide table).                |
-| `--timestamp-column` | `TIMESTAMP_COLUMN` | auto-detect             | Override the timestamp column name.                               |
-| `--line-column`      | `LINE_COLUMN`      | auto-detect             | Override the log line column name.                                |
-| `--labels-column`    | `LABELS_COLUMN`    | auto-detect (loki only) | Override the labels column name.                                  |
-| `--max-metric-buckets` | `MAX_METRIC_BUCKETS` | `240`                 | Maximum bucket count per metric range query before clamping `step`. |
+| Flag                   | Env                  | Default                 | Description                                                                |
+| ---------------------- | -------------------- | ----------------------- | -------------------------------------------------------------------------- |
+| `--mode`               | `ADAPTER_MODE`       | `standalone`            | `standalone` uses a fixed DSN/table, `proxy` pulls both from HTTP headers. |
+| `--dsn`                | `DATABEND_DSN`       | _required_              | Databend DSN with credentials (`proxy` mode expects it via header).        |
+| `--table`              | `LOGS_TABLE`         | `logs`                  | Target table. Use `db.table` or rely on the DSN default database.          |
+| `--bind`               | `BIND_ADDR`          | `0.0.0.0:3100`          | HTTP bind address.                                                         |
+| `--schema-type`        | `SCHEMA_TYPE`        | `loki`                  | `loki` (labels as VARIANT) or `flat` (wide table).                         |
+| `--timestamp-column`   | `TIMESTAMP_COLUMN`   | auto-detect             | Override the timestamp column name.                                        |
+| `--line-column`        | `LINE_COLUMN`        | auto-detect             | Override the log line column name.                                         |
+| `--labels-column`      | `LABELS_COLUMN`      | auto-detect (loki only) | Override the labels column name.                                           |
+| `--max-metric-buckets` | `MAX_METRIC_BUCKETS` | `240`                   | Maximum bucket count per metric range query before clamping `step`.        |
+
+## Run Modes
+
+`databend-loki-adapter` runs in two modes:
+
+- **standalone** (default): supply `--dsn`, `--table`, and schema overrides on the CLI/env. The adapter resolves the table once at startup and caches the schema for the entire process lifetime.
+- **proxy**: launch the server with `--mode proxy` and omit `--dsn`. Each HTTP request must pass the Databend DSN and schema definition in headers so multiple tenants/tables can share one adapter instance.
+
+### Proxy headers
+
+Proxy mode expects two headers on every request:
+
+| Header              | Purpose                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------ |
+| `X-Databend-Dsn`    | Databend DSN, e.g. `databend://user:pass@host:8000/default`.                                     |
+| `X-Databend-Schema` | JSON document that tells the adapter which table/columns to treat as Loki timestamp/labels/line. |
+
+`X-Databend-Schema` accepts the fields listed below. `schema_type` must be `loki` or `flat`. All column names are case-insensitive and must match the physical Databend table. Set `table` to either `db.table` or just the table name (the latter uses the DSN's default database).
+
+###### Loki schema example
+
+```json
+{
+  "table": "default.logs",
+  "schema_type": "loki",
+  "timestamp_column": "timestamp",
+  "line_column": "line",
+  "labels_column": "labels"
+}
+```
+
+###### Flat schema example
+
+```json
+{
+  "table": "analytics.nginx_logs",
+  "schema_type": "flat",
+  "timestamp_column": "timestamp",
+  "line_column": "request",
+  "label_columns": [
+    { "name": "host" },
+    { "name": "status", "numeric": true },
+    { "name": "client" }
+  ]
+}
+```
+
+`label_columns` is required for `flat` schemas and each entry can mark `numeric: true` to treat the label as a numeric column for selectors.
 
 ## Schema Support
 
@@ -120,14 +169,14 @@ Ensure the table matches one of the schemas above (including indexes) so Grafana
 
 All endpoints return Loki-compatible JSON responses and reuse the same error shape that Loki expects (`status:error`, `errorType`, `error`). Grafana can therefore talk to the adapter using the stock Loki data source without any proxy layers or plugins. Refer to the upstream [Loki HTTP API reference](https://grafana.com/docs/loki/latest/reference/loki-http-api/) for the detailed contract of each endpoint.
 
-| Endpoint                                | Description                                                                                                                                                                                                         |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /loki/api/v1/query`                | Instant query. Supports the same LogQL used by Grafana's Explore panel. An optional `time` parameter (nanoseconds) defaults to "now", and the adapter automatically looks back 5 minutes when computing SQL bounds. |
-| `GET /loki/api/v1/query_range`          | Range query. Accepts `start`/`end` (default past hour), `since` (relative duration), `limit`, `interval`, `step`, and `direction`. Log queries stream raw lines (`interval` down-samples entries, `direction` controls scan order); metric queries return Loki matrix results and require a `step` value (the adapter may clamp it to keep bucket counts bounded, default cap 240 buckets).          |
-| `GET /loki/api/v1/labels`               | Lists known label keys for the selected schema. Optional `start`/`end` parameters (nanoseconds) fence the search window; unspecified values default to the last 5 minutes, matching Grafana's Explore defaults.     |
-| `GET /loki/api/v1/label/{label}/values` | Lists distinct values for a specific label key using the same optional `start`/`end` bounds as `/labels`. Works for both `loki` and `flat` schemas and automatically filters out empty strings.                     |
-| `GET /loki/api/v1/index/stats`          | Returns approximate `streams`, `chunks`, `entries`, and `bytes` counters for a selector over a `[start, end]` window. `chunks` are estimated via unique stream keys because Databend does not store Loki chunks.    |
-| `GET /loki/api/v1/tail`                 | WebSocket tail endpoint that streams live logs for a LogQL query; compatible with Grafana Explore and `logcli --tail`.                                                                                            |
+| Endpoint                                | Description                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /loki/api/v1/query`                | Instant query. Supports the same LogQL used by Grafana's Explore panel. An optional `time` parameter (nanoseconds) defaults to "now", and the adapter automatically looks back 5 minutes when computing SQL bounds.                                                                                                                                                                         |
+| `GET /loki/api/v1/query_range`          | Range query. Accepts `start`/`end` (default past hour), `since` (relative duration), `limit`, `interval`, `step`, and `direction`. Log queries stream raw lines (`interval` down-samples entries, `direction` controls scan order); metric queries return Loki matrix results and require a `step` value (the adapter may clamp it to keep bucket counts bounded, default cap 240 buckets). |
+| `GET /loki/api/v1/labels`               | Lists known label keys for the selected schema. Optional `start`/`end` parameters (nanoseconds) fence the search window; unspecified values default to the last 5 minutes, matching Grafana's Explore defaults.                                                                                                                                                                             |
+| `GET /loki/api/v1/label/{label}/values` | Lists distinct values for a specific label key using the same optional `start`/`end` bounds as `/labels`. Works for both `loki` and `flat` schemas and automatically filters out empty strings.                                                                                                                                                                                             |
+| `GET /loki/api/v1/index/stats`          | Returns approximate `streams`, `chunks`, `entries`, and `bytes` counters for a selector over a `[start, end]` window. `chunks` are estimated via unique stream keys because Databend does not store Loki chunks.                                                                                                                                                                            |
+| `GET /loki/api/v1/tail`                 | WebSocket tail endpoint that streams live logs for a LogQL query; compatible with Grafana Explore and `logcli --tail`.                                                                                                                                                                                                                                                                      |
 
 `/query` and `/query_range` share the same LogQL parser and SQL builder. Instant queries fall back to `DEFAULT_LOOKBACK_NS` (5 minutes) when no explicit window is supplied, while range queries default to `[now - 1h, now]` and also honor Loki's `since` helper to derive `start`. `/loki/api/v1/query_range` log queries fully implement Loki's `direction` (`forward`/`backward`) and `interval` parameters: the adapter scans in the requested direction, emits entries in that order, and down-samples each stream so successive log lines are at least `interval` apart starting from `start`. `/labels` and `/label/{label}/values` delegate to schema-aware metadata lookups: the loki schema uses `map_keys`/`labels['key']` expressions, whereas the flat schema issues `SELECT DISTINCT` on the physical column and returns values in sorted order.
 
@@ -158,31 +207,31 @@ Both schema adapters (loki VARIANT labels and flat wide tables) translate the me
 
 `line_format` and `label_format` now ship with a lightweight template engine that supports field interpolation (`{{ .message }}`) plus the full set of [Grafana Loki template string functions](https://grafana.com/docs/loki/latest/query/template_functions/). Supported functions are listed below:
 
-| Function | Status | Notes |
-| --- | --- | --- |
-| `__line__`, `__timestamp__`, `now` | ✅ | Expose the raw line, the row timestamp, and the adapter host's current time. |
-| `date`, `toDate`, `toDateInZone` | ✅ | Go-style datetime formatting and parsing (supports IANA zones). |
-| `duration`, `duration_seconds` | ✅ | Parse Go duration strings into seconds (positive/negative). |
-| `unixEpoch`, `unixEpochMillis`, `unixEpochNanos`, `unixToTime` | ✅ | Unix timestamp helpers. |
-| `alignLeft`, `alignRight` | ✅ | Align field contents to a fixed width. |
-| `b64enc`, `b64dec` | ✅ | Base64 encode/decode a field or literal. |
-| `bytes` | ✅ | Parses human-readable byte strings (e.g. `2 KB` → `2000`). |
-| `default` | ✅ | Provides a fallback when a field is empty or missing. |
-| `fromJson` | ⚠️ | Validates and normalizes JSON strings (advanced loops like `range` remain unsupported). |
-| `indent`, `nindent` | ✅ | Indent multi-line strings. |
-| `lower`, `upper`, `title` | ✅ | Case conversion helpers. |
-| `repeat` | ✅ | String repetition helper. |
-| `printf` | ✅ | Supports `%s`, `%d`, `%f`, width/precision flags. |
-| `replace`, `substr`, `trunc` | ✅ | String replacement, slicing, and truncation. |
-| `trim`, `trimAll`, `trimPrefix`, `trimSuffix` | ✅ | String trimming helpers. |
-| `urlencode`, `urldecode` | ✅ | URL encoding/decoding. |
-| `contains`, `eq`, `hasPrefix`, `hasSuffix` | ✅ | Logical helpers for comparisons. |
-| `int`, `float64` | ✅ | Cast values to integers/floats. |
-| `add`, `addf`, `sub`, `subf`, `mul`, `mulf`, `div`, `divf`, `mod` | ✅ | Integer and floating-point arithmetic. |
-| `ceil`, `floor`, `round` | ✅ | Floating-point rounding helpers. |
-| `max`, `min`, `maxf`, `minf` | ✅ | Extremum helpers for integers/floats. |
-| `count` | ✅ | Count regex matches (`{{ __line__ | count "foo" }}`). |
-| `regexReplaceAll`, `regexReplaceAllLiteral` | ✅ | Regex replacement helpers (literal and capture-aware). |
+| Function                                                          | Status | Notes                                                                                   |
+| ----------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------- | ----------------- |
+| `__line__`, `__timestamp__`, `now`                                | ✅     | Expose the raw line, the row timestamp, and the adapter host's current time.            |
+| `date`, `toDate`, `toDateInZone`                                  | ✅     | Go-style datetime formatting and parsing (supports IANA zones).                         |
+| `duration`, `duration_seconds`                                    | ✅     | Parse Go duration strings into seconds (positive/negative).                             |
+| `unixEpoch`, `unixEpochMillis`, `unixEpochNanos`, `unixToTime`    | ✅     | Unix timestamp helpers.                                                                 |
+| `alignLeft`, `alignRight`                                         | ✅     | Align field contents to a fixed width.                                                  |
+| `b64enc`, `b64dec`                                                | ✅     | Base64 encode/decode a field or literal.                                                |
+| `bytes`                                                           | ✅     | Parses human-readable byte strings (e.g. `2 KB` → `2000`).                              |
+| `default`                                                         | ✅     | Provides a fallback when a field is empty or missing.                                   |
+| `fromJson`                                                        | ⚠️     | Validates and normalizes JSON strings (advanced loops like `range` remain unsupported). |
+| `indent`, `nindent`                                               | ✅     | Indent multi-line strings.                                                              |
+| `lower`, `upper`, `title`                                         | ✅     | Case conversion helpers.                                                                |
+| `repeat`                                                          | ✅     | String repetition helper.                                                               |
+| `printf`                                                          | ✅     | Supports `%s`, `%d`, `%f`, width/precision flags.                                       |
+| `replace`, `substr`, `trunc`                                      | ✅     | String replacement, slicing, and truncation.                                            |
+| `trim`, `trimAll`, `trimPrefix`, `trimSuffix`                     | ✅     | String trimming helpers.                                                                |
+| `urlencode`, `urldecode`                                          | ✅     | URL encoding/decoding.                                                                  |
+| `contains`, `eq`, `hasPrefix`, `hasSuffix`                        | ✅     | Logical helpers for comparisons.                                                        |
+| `int`, `float64`                                                  | ✅     | Cast values to integers/floats.                                                         |
+| `add`, `addf`, `sub`, `subf`, `mul`, `mulf`, `div`, `divf`, `mod` | ✅     | Integer and floating-point arithmetic.                                                  |
+| `ceil`, `floor`, `round`                                          | ✅     | Floating-point rounding helpers.                                                        |
+| `max`, `min`, `maxf`, `minf`                                      | ✅     | Extremum helpers for integers/floats.                                                   |
+| `count`                                                           | ✅     | Count regex matches (`{{ **line**                                                       | count "foo" }}`). |
+| `regexReplaceAll`, `regexReplaceAllLiteral`                       | ✅     | Regex replacement helpers (literal and capture-aware).                                  |
 
 `fromJson` currently only validates and re-serializes JSON strings because the template engine has no looping constructs yet. For advanced constructs (e.g., `range`), preprocess data upstream or continue to rely on Grafana/Loki-native features until control flow support arrives.
 
