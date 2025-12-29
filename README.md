@@ -208,7 +208,7 @@ Both schema adapters (loki VARIANT labels and flat wide tables) translate the me
 `line_format` and `label_format` now ship with a lightweight template engine that supports field interpolation (`{{ .message }}`) plus the full set of [Grafana Loki template string functions](https://grafana.com/docs/loki/latest/query/template_functions/). Supported functions are listed below:
 
 | Function                                                          | Status | Notes                                                                                   |
-| ----------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------- | ----------------- |
+| ----------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------- |
 | `__line__`, `__timestamp__`, `now`                                | ✅     | Expose the raw line, the row timestamp, and the adapter host's current time.            |
 | `date`, `toDate`, `toDateInZone`                                  | ✅     | Go-style datetime formatting and parsing (supports IANA zones).                         |
 | `duration`, `duration_seconds`                                    | ✅     | Parse Go duration strings into seconds (positive/negative).                             |
@@ -230,7 +230,7 @@ Both schema adapters (loki VARIANT labels and flat wide tables) translate the me
 | `add`, `addf`, `sub`, `subf`, `mul`, `mulf`, `div`, `divf`, `mod` | ✅     | Integer and floating-point arithmetic.                                                  |
 | `ceil`, `floor`, `round`                                          | ✅     | Floating-point rounding helpers.                                                        |
 | `max`, `min`, `maxf`, `minf`                                      | ✅     | Extremum helpers for integers/floats.                                                   |
-| `count`                                                           | ✅     | Count regex matches (`{{ **line**                                                       | count "foo" }}`). |
+| `count`                                                           | ✅     | Count regex matches (`{{ **line** count "foo" }}`).                                     |
 | `regexReplaceAll`, `regexReplaceAllLiteral`                       | ✅     | Regex replacement helpers (literal and capture-aware).                                  |
 
 `fromJson` currently only validates and re-serializes JSON strings because the template engine has no looping constructs yet. For advanced constructs (e.g., `range`), preprocess data upstream or continue to rely on Grafana/Loki-native features until control flow support arrives.
