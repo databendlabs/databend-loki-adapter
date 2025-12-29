@@ -14,7 +14,7 @@
 
 use std::{fmt::Display, net::SocketAddr};
 
-use app::{AppConfig, AppState, router};
+use app::{AppConfig, AppState, RuntimeConfig, StandaloneConfig, router};
 use clap::{Parser, ValueEnum};
 use databend::{SchemaConfig, SchemaType};
 use error::AppError;
@@ -30,9 +30,21 @@ const DEFAULT_MAX_METRIC_BUCKETS: u32 = 240;
 #[derive(Debug, Parser)]
 #[command(author, version, about, disable_help_subcommand = true)]
 struct Args {
-    /// Databend DSN string, e.g. databend://user:pass@host:port/db
-    #[arg(long = "dsn", env = "DATABEND_DSN")]
-    dsn: String,
+    /// Adapter runtime mode
+    #[arg(
+        long = "mode",
+        env = "ADAPTER_MODE",
+        value_enum,
+        default_value = "standalone"
+    )]
+    mode: AdapterModeArg,
+    /// Databend DSN string, e.g. databend://user:pass@host:port/db (standalone mode only)
+    #[arg(
+        long = "dsn",
+        env = "DATABEND_DSN",
+        required_if_eq("mode", "standalone")
+    )]
+    dsn: Option<String>,
     /// Target table to query; can be plain name or db.table
     #[arg(long, env = "LOGS_TABLE", default_value = "logs")]
     table: String,
@@ -66,6 +78,12 @@ struct Args {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+enum AdapterModeArg {
+    Standalone,
+    Proxy,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 enum SchemaTypeArg {
     Loki,
     Flat,
@@ -89,23 +107,50 @@ impl Display for SchemaTypeArg {
     }
 }
 
+impl Display for AdapterModeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdapterModeArg::Standalone => write!(f, "standalone"),
+            AdapterModeArg::Proxy => write!(f, "proxy"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     init_logging();
     let args = Args::parse();
     info!(
-        "starting databend-loki-adapter (table={}, schema_type={}, bind={})",
-        args.table, args.schema_type, args.bind
+        "starting databend-loki-adapter (mode={}, bind={})",
+        args.mode, args.bind
     );
+    if matches!(args.mode, AdapterModeArg::Standalone) {
+        info!(
+            "standalone configuration: table={} schema_type={}",
+            args.table, args.schema_type
+        );
+    }
+    let runtime = match args.mode {
+        AdapterModeArg::Standalone => {
+            let dsn = args
+                .dsn
+                .clone()
+                .ok_or_else(|| AppError::Config("--dsn is required in standalone mode".into()))?;
+            RuntimeConfig::Standalone(StandaloneConfig {
+                dsn,
+                table: args.table.clone(),
+                schema_type: args.schema_type.into(),
+                schema_config: SchemaConfig {
+                    timestamp_column: args.timestamp_column.clone(),
+                    line_column: args.line_column.clone(),
+                    labels_column: args.labels_column.clone(),
+                },
+            })
+        }
+        AdapterModeArg::Proxy => RuntimeConfig::Proxy,
+    };
     let config = AppConfig {
-        dsn: args.dsn.clone(),
-        table: args.table.clone(),
-        schema_type: args.schema_type.into(),
-        schema_config: SchemaConfig {
-            timestamp_column: args.timestamp_column.clone(),
-            line_column: args.line_column.clone(),
-            labels_column: args.labels_column.clone(),
-        },
+        runtime,
         max_metric_buckets: args.max_metric_buckets,
     };
     info!("bootstrapping application state");

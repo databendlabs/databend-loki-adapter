@@ -23,7 +23,10 @@ use crate::{
     logql::{LineFilter, LineFilterOp, LogqlExpr, MetricExpr, RangeFunction, VectorAggregationOp},
 };
 
-use super::{flat::FlatSchema, loki::LokiSchema};
+use super::{
+    flat::{FlatLabelColumn, FlatSchema},
+    loki::LokiSchema,
+};
 
 pub async fn execute_query(client: &Client, sql: &str) -> Result<Vec<Row>, AppError> {
     let conn = client.get_conn().await?;
@@ -174,6 +177,57 @@ impl SchemaAdapter {
         match self {
             SchemaAdapter::Loki(schema) => schema.build_index_stats_query(table, expr, bounds),
             SchemaAdapter::Flat(schema) => schema.build_index_stats_query(table, expr, bounds),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LokiSchemaDefinition {
+    pub timestamp_column: String,
+    pub labels_column: String,
+    pub line_column: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlatSchemaDefinition {
+    pub timestamp_column: String,
+    pub line_column: String,
+    pub label_columns: Vec<FlatLabelDefinition>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlatLabelDefinition {
+    pub name: String,
+    pub numeric: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum SchemaDefinition {
+    Loki(LokiSchemaDefinition),
+    Flat(FlatSchemaDefinition),
+}
+
+pub fn schema_from_definition(definition: SchemaDefinition) -> SchemaAdapter {
+    match definition {
+        SchemaDefinition::Loki(def) => SchemaAdapter::Loki(LokiSchema {
+            timestamp_col: def.timestamp_column,
+            labels_col: def.labels_column,
+            line_col: def.line_column,
+        }),
+        SchemaDefinition::Flat(def) => {
+            let label_cols = def
+                .label_columns
+                .into_iter()
+                .map(|column| FlatLabelColumn {
+                    name: column.name,
+                    is_numeric: column.numeric,
+                })
+                .collect();
+            SchemaAdapter::Flat(FlatSchema {
+                timestamp_col: def.timestamp_column,
+                line_col: def.line_column,
+                label_cols,
+            })
         }
     }
 }
