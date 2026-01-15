@@ -19,7 +19,7 @@ byte-unit = "5.0.1"
 clap = { version = "4.5.21", features = ["derive", "env"] }
 chrono = { version = "0.4.38", default-features = false, features = ["clock"] }
 chrono-tz = "0.10.1"
-databend-driver = "0.33.0"
+databend-driver = "0.33.2"
 env_logger = "0.11.5"
 nom = "8.0.0"
 once_cell = "1.19.0"

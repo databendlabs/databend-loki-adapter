@@ -776,9 +776,9 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 
 [[package]]
 name = "databend-client"
-version = "0.33.0"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "096f2c04fa1a99efd790f92efeb8f968bb21e168c3582620327cd7860cb53d7a"
+checksum = "0a128a098ced71cda0f9ef71cc1dbb1fff9a1994d3be9cacb086acb9308156c1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -837,9 +837,9 @@ dependencies = [
 
 [[package]]
 name = "databend-driver"
-version = "0.33.0"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5547be89dd515d14c4975766ef72d7b414faa3d033e652aa07d9e62f8adaf198"
+checksum = "b00d5cf4e005a1fed2b390c4b0602113b2ea0a69846c3063f3bc29a321a4bc9a"
 dependencies = [
  "arrow",
  "async-trait",
@@ -864,9 +864,9 @@ dependencies = [
 
 [[package]]
 name = "databend-driver-core"
-version = "0.33.0"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cbc630976bdb68a507513ee3fa1975d42d131452df4583f8e8692a1d2370d5c"
+checksum = "18fd7999f5222ed639434b8d5a27d8917b78a9dce0d3037d879094f942f80208"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -889,13 +889,14 @@ dependencies = [
  "serde_json",
  "tokio-stream",
  "url",
+ "zmij",
 ]
 
 [[package]]
 name = "databend-driver-macros"
-version = "0.33.0"
+version = "0.33.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd7fd3e3ad6865ac49216df143a9b46cf5622adae5b96718ab2807a4d4ee9114"
+checksum = "f58d66a42ad7927928e4c5dc8ed3ab6f00173bbb7b1f9a59e98cf4d0a43f34ea"
 dependencies = [
  "quote",
  "syn 2.0.111",
@@ -4176,6 +4177,12 @@ dependencies = [
  "quote",
  "syn 2.0.111",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd8f3f50b848df28f887acb68e41201b5aea6bc8a8dacc00fb40635ff9a72fea"
 
 [[package]]
 name = "zstd"
