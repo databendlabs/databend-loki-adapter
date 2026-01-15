@@ -15,6 +15,7 @@
 use axum::http::HeaderMap;
 use databend_driver::Client;
 use log::{info, warn};
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 
 use crate::{
@@ -32,6 +33,12 @@ pub(crate) const MAX_LIMIT: u64 = 5_000;
 pub(crate) const DEFAULT_LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 pub const PROXY_DSN_HEADER: &str = "x-databend-dsn";
 pub const PROXY_SCHEMA_HEADER: &str = "x-databend-schema";
+pub const PROXY_USER_AGENT_HEADER: &str = "user-agent";
+
+static VERSION: Lazy<String> = Lazy::new(|| {
+    let version = option_env!("CARGO_PKG_VERSION").unwrap_or("unknown");
+    version.to_string()
+});
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,7 +64,8 @@ impl AppState {
                 info!("resolving table reference for `{table}`");
                 let table = resolve_table_ref(&dsn, &table)?;
                 info!("table resolved to {}", table.fq_name());
-                let client = Client::new(dsn.clone());
+                let ua = format!("databend-loki-adapter/{}", VERSION.as_str());
+                let client = Client::new(dsn.clone()).with_name(ua);
                 verify_connection(&client).await?;
                 info!(
                     "loading {} schema metadata for {}",
@@ -145,6 +153,7 @@ impl ProxyState {
     fn resolve(&self, headers: &HeaderMap) -> Result<RequestContext, AppError> {
         let dsn_header = parse_header(headers, PROXY_DSN_HEADER)?;
         let schema_header = parse_header(headers, PROXY_SCHEMA_HEADER)?;
+        let ua_header = parse_header(headers, PROXY_USER_AGENT_HEADER)?;
         let schema_payload: ProxySchemaPayload =
             serde_json::from_str(schema_header).map_err(|err| {
                 AppError::BadRequest(format!(
@@ -159,8 +168,13 @@ impl ProxyState {
         let table = resolve_table_ref(dsn_header, schema_payload.table.trim())?;
         let definition = schema_payload.into_definition()?;
         let schema = schema_from_definition(definition);
+        let ua = if ua_header.is_empty() {
+            format!("databend-loki-adapter/{}", VERSION.as_str())
+        } else {
+            ua_header.to_string()
+        };
         Ok(RequestContext {
-            client: Client::new(dsn_header.to_string()),
+            client: Client::new(dsn_header.to_string()).with_name(ua),
             table,
             schema,
         })
